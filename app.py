@@ -45,6 +45,8 @@ def api_capture():
     payload = request.get_json(silent=True) or {}
     url = (payload.get("url") or "").strip()
     show_browser = bool(payload.get("showBrowser"))
+    dark_mode = payload.get("darkMode")
+    dark_mode = True if dark_mode is None else bool(dark_mode)
 
     if not url:
         return jsonify({"ok": False, "error": "请输入推文链接"}), 400
@@ -59,6 +61,7 @@ def api_capture():
             SCREENSHOTS_DIR,
             PROFILE_DIR,
             headless=not show_browser,
+            dark_mode=dark_mode,
         ).result()
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400

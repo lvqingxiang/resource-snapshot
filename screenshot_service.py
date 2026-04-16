@@ -19,39 +19,85 @@ TWEET_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-DETAIL_CAPTURE_CSS = """
-html {
-  scroll-behavior: auto !important;
-  background: #ffffff !important;
-}
+def _detail_capture_css(dark_mode: bool) -> str:
+    background = "#000000" if dark_mode else "#ffffff"
+    text = "#e7e9ea" if dark_mode else "#0f1419"
+    muted = "#71767b" if dark_mode else "#536471"
+    border = "#2f3336" if dark_mode else "#eff3f4"
+    link = "#1d9bf0"
 
-body {
-  background: #ffffff !important;
-}
+    return f"""
+html {{
+  scroll-behavior: auto !important;
+  background: {background} !important;
+  color-scheme: {"dark" if dark_mode else "light"} !important;
+}}
+
+body {{
+  background: {background} !important;
+  color: {text} !important;
+}}
 
 [data-testid="BottomBar"],
 [data-testid="DMDrawer"],
 [data-testid="sidebarColumn"],
-header[role="banner"] {
+header[role="banner"],
+[data-testid="logged_out_read_replies_pivot"],
+[data-testid="inline_reply_offscreen"],
+[data-testid="tweetTextarea_0"],
+[data-testid="inline_reply_composer"] {{
   display: none !important;
-}
+}}
 
-main[role="main"] {
+main[role="main"] {{
   display: block !important;
-}
+  background: {background} !important;
+}}
 
-[data-testid="primaryColumn"] {
+[data-testid="primaryColumn"] {{
   width: min(760px, calc(100vw - 32px)) !important;
   max-width: none !important;
   margin: 0 auto !important;
-}
+  background: {background} !important;
+}}
+
+article[data-testid="tweet"],
+[data-testid="cellInnerDiv"],
+[data-testid="tweet"],
+[data-testid="tweetText"],
+[data-testid="tweetPhoto"],
+[role="group"] {{
+  background: {background} !important;
+  border-color: {border} !important;
+}}
+
+article[data-testid="tweet"],
+article[data-testid="tweet"] * {{
+  color: {text} !important;
+}}
+
+article[data-testid="tweet"] a,
+article[data-testid="tweet"] a * {{
+  color: {link} !important;
+}}
+
+article[data-testid="tweet"] time,
+article[data-testid="tweet"] time *,
+[data-testid="User-Name"] span:last-child,
+[data-testid="app-text-transition-container"] {{
+  color: {muted} !important;
+}}
 """
 
-EMBED_CAPTURE_CSS = """
-html, body {
+
+def _embed_capture_css(dark_mode: bool) -> str:
+    background = "#15202b" if dark_mode else "#ffffff"
+    return f"""
+html, body {{
   margin: 0 !important;
-  background: #ffffff !important;
-}
+  background: {background} !important;
+  color-scheme: {"dark" if dark_mode else "light"} !important;
+}}
 """
 
 
@@ -142,14 +188,36 @@ def _dismiss_common_overlays(page) -> None:
     )
 
 
-def _wait_for_tweet_card(page, timeout_ms: int):
-    selectors = [
-        "article[data-testid='tweet']",
-        "main article",
-        "article",
-    ]
-    for selector in selectors:
-        locator = page.locator(selector).first
+def _wait_for_tweet_card(page, tweet_id: str, mode: str, timeout_ms: int):
+    locators = []
+
+    if mode == "detail_page":
+        permalink = page.locator(
+            ",".join(
+                [
+                    f"a[href*='/status/{tweet_id}']",
+                    f"a[href*='/i/web/status/{tweet_id}']",
+                    f"a[href$='/{tweet_id}']",
+                ]
+            )
+        )
+        locators.extend(
+            [
+                page.locator("article[data-testid='tweet']").filter(has=permalink).first,
+                page.locator("article[data-testid='tweet']").first,
+                page.locator("[data-testid='cellInnerDiv']").filter(has=permalink).locator("article[data-testid='tweet']").first,
+                page.locator("[data-testid='cellInnerDiv']").first,
+            ]
+        )
+    else:
+        locators.extend(
+            [
+                page.locator("article").first,
+                page.locator("main article").first,
+            ]
+        )
+
+    for locator in locators:
         try:
             locator.wait_for(state="visible", timeout=timeout_ms)
             return locator
@@ -211,7 +279,112 @@ def _wait_for_tweet_assets(page, tweet_card) -> None:
     page.wait_for_timeout(1200)
 
 
-def _capture_detail_snapshot(tweet_card, path: Path) -> None:
+def _compute_capture_clip(page, tweet_card):
+    element = tweet_card.element_handle(timeout=5000)
+    if element is None:
+        return None
+
+    return page.evaluate(
+        """
+        (el) => {
+          const doc = document.documentElement;
+          const rootRect = el.getBoundingClientRect();
+          const mediaSelector = 'img, svg, video, canvas, picture, iframe';
+
+          let left = Infinity;
+          let top = Infinity;
+          let right = -Infinity;
+          let bottom = -Infinity;
+
+          const addRect = (rect) => {
+            if (!rect || rect.width < 2 || rect.height < 2) {
+              return;
+            }
+            left = Math.min(left, rect.left + window.scrollX);
+            top = Math.min(top, rect.top + window.scrollY);
+            right = Math.max(right, rect.right + window.scrollX);
+            bottom = Math.max(bottom, rect.bottom + window.scrollY);
+          };
+
+          const isVisible = (node) => {
+            const style = window.getComputedStyle(node);
+            if (!style) {
+              return false;
+            }
+            if (style.display === 'none' || style.visibility === 'hidden') {
+              return false;
+            }
+            if (Number(style.opacity || '1') === 0) {
+              return false;
+            }
+            return true;
+          };
+
+          const textRects = () => {
+            const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+            while (walker.nextNode()) {
+              const textNode = walker.currentNode;
+              if (!textNode.textContent || !textNode.textContent.trim()) {
+                continue;
+              }
+              const parent = textNode.parentElement;
+              if (!parent || !isVisible(parent)) {
+                continue;
+              }
+
+              const range = document.createRange();
+              range.selectNodeContents(textNode);
+              for (const rect of range.getClientRects()) {
+                addRect(rect);
+              }
+            }
+          };
+
+          textRects();
+
+          for (const node of el.querySelectorAll(mediaSelector)) {
+            if (!isVisible(node)) {
+              continue;
+            }
+            for (const rect of node.getClientRects()) {
+              addRect(rect);
+            }
+          }
+
+          if (!Number.isFinite(left)) {
+            const rootX = rootRect.left + window.scrollX;
+            const rootY = rootRect.top + window.scrollY;
+            left = rootX;
+            top = rootY;
+            right = rootX + rootRect.width;
+            bottom = rootY + rootRect.height;
+          }
+
+          const padding = 12;
+          const x = Math.max(0, Math.floor(left - padding));
+          const y = Math.max(0, Math.floor(top - padding));
+          const maxRight = Math.max(doc.scrollWidth, right + padding);
+          const maxBottom = Math.max(doc.scrollHeight, bottom + padding);
+          const width = Math.max(1, Math.ceil(Math.min(maxRight, right + padding) - x));
+          const height = Math.max(1, Math.ceil(Math.min(maxBottom, bottom + padding) - y));
+
+          return { x, y, width, height };
+        }
+        """,
+        arg=element,
+    )
+
+
+def _capture_detail_snapshot(page, tweet_card, path: Path) -> None:
+    clip = _compute_capture_clip(page, tweet_card)
+    if clip:
+        page.screenshot(
+            path=str(path),
+            animations="disabled",
+            clip=clip,
+        )
+        return
+
     tweet_card.screenshot(
         path=str(path),
         animations="disabled",
@@ -230,6 +403,7 @@ def capture_tweet_page(
     profile_dir: Path | str,
     *,
     headless: bool = True,
+    dark_mode: bool = True,
 ) -> CaptureResult:
     normalized_url = _normalize_input_url(url)
     screen_name, tweet_id = _extract_parts(normalized_url)
@@ -253,7 +427,7 @@ def capture_tweet_page(
             viewport={"width": 1280, "height": 1800},
             device_scale_factor=2,
             locale="zh-CN",
-            color_scheme="light",
+            color_scheme="dark" if dark_mode else "light",
             ignore_https_errors=True,
             args=["--disable-blink-features=AutomationControlled"],
         )
@@ -262,12 +436,17 @@ def capture_tweet_page(
             page = context.pages[0] if context.pages else context.new_page()
             page.set_default_timeout(wait_timeout_ms)
             page.set_default_navigation_timeout(wait_timeout_ms)
+            page.emulate_media(color_scheme="dark" if dark_mode else "light")
 
             last_error: Exception | None = None
 
             for candidate_url, mode in _candidate_urls(normalized_url, screen_name, tweet_id):
                 try:
-                    page.goto(candidate_url, wait_until="domcontentloaded")
+                    active_url = candidate_url
+                    if mode == "embed_card" and dark_mode:
+                        active_url = f"{candidate_url}&theme=dark"
+
+                    page.goto(active_url, wait_until="domcontentloaded")
                     try:
                         page.wait_for_load_state("networkidle", timeout=5000)
                     except PlaywrightTimeoutError:
@@ -275,20 +454,27 @@ def capture_tweet_page(
 
                     _dismiss_common_overlays(page)
 
-                    tweet_card = _wait_for_tweet_card(page, wait_timeout_ms if mode == "detail_page" else 12000)
+                    tweet_card = _wait_for_tweet_card(
+                        page,
+                        tweet_id,
+                        mode,
+                        wait_timeout_ms if mode == "detail_page" else 12000,
+                    )
                     if tweet_card is None:
                         raise RuntimeError("页面里没有找到可截图的推文主体")
 
-                    page.add_style_tag(content=DETAIL_CAPTURE_CSS if mode == "detail_page" else EMBED_CAPTURE_CSS)
+                    page.add_style_tag(
+                        content=_detail_capture_css(dark_mode) if mode == "detail_page" else _embed_capture_css(dark_mode)
+                    )
                     _dismiss_common_overlays(page)
                     _scroll_tweet_into_view(page, tweet_card)
                     _wait_for_tweet_assets(page, tweet_card)
 
-                    used_url = candidate_url
+                    used_url = active_url
                     capture_mode = mode
 
                     if mode == "detail_page":
-                        _capture_detail_snapshot(tweet_card, saved_to)
+                        _capture_detail_snapshot(page, tweet_card, saved_to)
                     else:
                         tweet_card.screenshot(
                             path=str(saved_to),

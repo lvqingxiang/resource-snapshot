@@ -286,6 +286,11 @@
           <span>显示浏览器。如果这条推文需要登录查看，勾选后可以先在可见浏览器里登录 X，再继续截图。</span>
         </label>
 
+        <label class="toggle">
+          <input id="darkMode" type="checkbox" checked>
+          <span>夜间模式截图。默认按暗色主题抓取推文，适合直接保存成深色视觉稿。</span>
+        </label>
+
         <div id="status" class="status"></div>
       </div>
 
@@ -327,6 +332,7 @@
     const btn = document.getElementById('captureBtn');
     const input = document.getElementById('url');
     const showBrowser = document.getElementById('showBrowser');
+    const darkMode = document.getElementById('darkMode');
     const status = document.getElementById('status');
     const resultCard = document.getElementById('resultCard');
     const emptyState = document.getElementById('emptyState');
@@ -361,7 +367,8 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             url,
-            showBrowser: showBrowser.checked
+            showBrowser: showBrowser.checked,
+            darkMode: darkMode.checked
           })
         });
 
