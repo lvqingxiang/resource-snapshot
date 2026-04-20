@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from html import unescape
+import json
 from pathlib import Path
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request, urlopen
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -17,6 +20,44 @@ TWEET_URL_RE = re.compile(
     r"(?P<screen_name>[^/?#]+)/status/(?P<tweet_id>\d+)",
     re.IGNORECASE,
 )
+TRANSLATION_API_URL = "https://api.mymemory.translated.net/get"
+TRANSLATION_ATTR = "data-resource-snapshot-translation"
+
+
+def _translation_capture_css(dark_mode: bool) -> str:
+    background = "rgba(29, 155, 240, 0.12)" if dark_mode else "rgba(29, 155, 240, 0.10)"
+    text = "#e7e9ea" if dark_mode else "#0f1419"
+    muted = "#8ecdfd" if dark_mode else "#1d6fa5"
+    border = "#1d9bf0"
+
+    return f"""
+[{TRANSLATION_ATTR}="block"] {{
+  margin-top: 10px !important;
+  padding: 10px 12px !important;
+  border-left: 3px solid {border} !important;
+  border-radius: 14px !important;
+  background: {background} !important;
+}}
+
+[{TRANSLATION_ATTR}="label"] {{
+  display: block !important;
+  margin-bottom: 4px !important;
+  color: {muted} !important;
+  font-size: 13px !important;
+  line-height: 1.4 !important;
+  letter-spacing: 0.02em !important;
+}}
+
+[{TRANSLATION_ATTR}="body"] {{
+  display: block !important;
+  color: {text} !important;
+  font-size: 15px !important;
+  line-height: 1.65 !important;
+  white-space: pre-wrap !important;
+  word-break: break-word !important;
+}}
+"""
+
 
 def _detail_capture_css(dark_mode: bool) -> str:
     background = "#000000" if dark_mode else "#ffffff"
@@ -86,6 +127,7 @@ article[data-testid="tweet"] time *,
 [data-testid="app-text-transition-container"] {{
   color: {muted} !important;
 }}
+{_translation_capture_css(dark_mode)}
 """
 
 
@@ -97,6 +139,7 @@ html, body {{
   background: {background} !important;
   color-scheme: {"dark" if dark_mode else "light"} !important;
 }}
+{_translation_capture_css(dark_mode)}
 """
 
 
@@ -301,6 +344,227 @@ def _wait_for_tweet_assets(page, tweet_card) -> None:
         pass
 
     page.wait_for_timeout(1200)
+
+
+def _normalize_translation_lang(lang: str | None) -> str | None:
+    value = (lang or "").strip()
+    if not value:
+        return None
+
+    lowered = value.replace("_", "-").lower()
+    if lowered in {"zh", "zh-cn", "zh-hans", "zh-sg"}:
+        return "zh-CN"
+    if lowered in {"zh-tw", "zh-hk", "zh-hant"}:
+        return "zh-TW"
+    return lowered
+
+
+def _extract_translatable_text_blocks(tweet_card) -> list[dict[str, str | int | None]]:
+    try:
+        blocks = tweet_card.evaluate(
+            """
+            (root) => {
+              const isVisible = (node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style) {
+                  return false;
+                }
+                if (style.display === 'none' || style.visibility === 'hidden') {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width >= 8 && rect.height >= 8;
+              };
+
+              return [...root.querySelectorAll('[data-testid="tweetText"]')]
+                .filter((node) => isVisible(node))
+                .map((node, index) => ({
+                  index,
+                  text: (node.innerText || '').trim(),
+                  lang: node.getAttribute('lang') || node.querySelector('[lang]')?.getAttribute('lang') || '',
+                }))
+                .filter((item) => item.text);
+            }
+            """
+        )
+    except Exception:
+        return []
+
+    if not isinstance(blocks, list):
+        return []
+    return blocks
+
+
+def _translate_text_to_chinese(text: str, source_lang: str | None) -> str | None:
+    normalized_text = (text or "").strip()
+    normalized_lang = _normalize_translation_lang(source_lang)
+    if not normalized_text or not normalized_lang or normalized_lang.startswith("zh"):
+        return None
+
+    query = urlencode({"q": normalized_text, "langpair": f"{normalized_lang}|zh-CN"})
+    request = Request(
+        f"{TRANSLATION_API_URL}?{query}",
+        headers={
+            "User-Agent": "resource-snapshot/1.0",
+            "Accept": "application/json",
+        },
+    )
+
+    try:
+        with urlopen(request, timeout=12) as response:
+            payload = json.load(response)
+    except Exception:
+        return None
+
+    if payload.get("responseStatus") != 200:
+        return None
+
+    translated = unescape(str(payload.get("responseData", {}).get("translatedText") or "")).strip()
+    if not translated:
+        return None
+    if translated.casefold() == normalized_text.casefold():
+        return None
+    return translated
+
+
+def _inject_chinese_translations(tweet_card) -> int:
+    text_blocks = _extract_translatable_text_blocks(tweet_card)
+    if not text_blocks:
+        return 0
+
+    cache: dict[tuple[str, str], str | None] = {}
+    items: list[dict[str, str | int]] = []
+    for block in text_blocks:
+        text = str(block.get("text") or "").strip()
+        lang = _normalize_translation_lang(block.get("lang"))
+        if not text or not lang or lang.startswith("zh"):
+            continue
+
+        cache_key = (text, lang)
+        if cache_key not in cache:
+            cache[cache_key] = _translate_text_to_chinese(text, lang)
+
+        translation = cache[cache_key]
+        if not translation:
+            continue
+
+        items.append(
+            {
+                "index": int(block["index"]),
+                "translation": translation,
+            }
+        )
+
+    if not items:
+        return 0
+
+    try:
+        inserted = tweet_card.evaluate(
+            f"""
+            (root, entries) => {{
+              const isVisible = (node) => {{
+                if (!(node instanceof Element)) {{
+                  return false;
+                }}
+                const style = window.getComputedStyle(node);
+                if (!style) {{
+                  return false;
+                }}
+                if (style.display === 'none' || style.visibility === 'hidden') {{
+                  return false;
+                }}
+                const rect = node.getBoundingClientRect();
+                return rect.width >= 8 && rect.height >= 8;
+              }};
+
+              root.querySelectorAll('[{TRANSLATION_ATTR}="block"]').forEach((node) => node.remove());
+              const blocks = [...root.querySelectorAll('[data-testid="tweetText"]')].filter((node) => isVisible(node));
+              let count = 0;
+
+              for (const entry of entries) {{
+                const anchor = blocks[entry.index];
+                if (!anchor || !entry.translation) {{
+                  continue;
+                }}
+
+                const wrapper = document.createElement('div');
+                wrapper.setAttribute('{TRANSLATION_ATTR}', 'block');
+
+                const label = document.createElement('span');
+                label.setAttribute('{TRANSLATION_ATTR}', 'label');
+                label.textContent = '中文翻译';
+
+                const body = document.createElement('span');
+                body.setAttribute('{TRANSLATION_ATTR}', 'body');
+                body.textContent = entry.translation;
+
+                wrapper.append(label, body);
+                anchor.insertAdjacentElement('afterend', wrapper);
+                count += 1;
+              }}
+
+              return count;
+            }}
+            """,
+            items,
+        )
+    except Exception:
+        return 0
+
+    if isinstance(inserted, int):
+        return inserted
+    return 0
+
+
+def _remove_native_translation_ui(tweet_card) -> None:
+    try:
+        tweet_card.evaluate(
+            """
+            (root) => {
+              const exactTexts = new Set([
+                '显示翻译',
+                'Translate post',
+                'Translate Tweet',
+                'Show translation',
+                '查看翻译',
+                '重试',
+              ]);
+              const blockTexts = ['无法获取翻译'];
+
+              const candidates = [
+                ...root.querySelectorAll('button, [role="button"], a, div, span'),
+              ];
+
+              for (const node of candidates) {
+                if (!(node instanceof HTMLElement)) {
+                  continue;
+                }
+                const text = (node.innerText || '').trim();
+                if (!text) {
+                  continue;
+                }
+                const matchesExact = exactTexts.has(text);
+                const matchesBlock = blockTexts.some((value) => text.includes(value));
+                if (!matchesExact && !matchesBlock) {
+                  continue;
+                }
+                if (node.hasAttribute('data-testid') && node.getAttribute('data-testid') === 'tweetText') {
+                  continue;
+                }
+
+                const target = matchesExact
+                  ? node.closest('button, [role="button"], a') || node
+                  : node;
+                target.remove();
+              }
+            }
+            """
+        )
+    except Exception:
+        return
 
 
 def _prepare_video_frame(tweet_card, target_seconds: float | None) -> float | None:
@@ -768,6 +1032,7 @@ def capture_tweet_page(
     headless: bool = True,
     dark_mode: bool = True,
     video_timestamp_seconds: float | None = None,
+    translate_body: bool = True,
 ) -> CaptureResult:
     normalized_url = _normalize_input_url(url)
     screen_name, tweet_id = _extract_parts(normalized_url)
@@ -832,8 +1097,12 @@ def capture_tweet_page(
                         content=_detail_capture_css(dark_mode) if mode == "detail_page" else _embed_capture_css(dark_mode)
                     )
                     _dismiss_common_overlays(page)
-                    _scroll_tweet_into_view(page, tweet_card)
                     _wait_for_tweet_assets(page, tweet_card)
+                    if translate_body:
+                        _inject_chinese_translations(tweet_card)
+                        _remove_native_translation_ui(tweet_card)
+                    _scroll_tweet_into_view(page, tweet_card)
+                    page.wait_for_timeout(250)
                     video_frame_seconds = _prepare_video_frame(tweet_card, video_timestamp_seconds)
 
                     used_url = active_url

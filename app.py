@@ -32,7 +32,7 @@ def _parse_video_timestamp(value) -> float | None:
 
     parts = raw.split(":")
     if len(parts) > 3 or any(part.strip() == "" for part in parts):
-        raise ValueError("视频时间点格式不正确，支持 1.2 或 00:01.2")
+        raise ValueError("视频时间点格式不太对，可以填 2、10.5 或 01:23")
 
     total_seconds = 0.0
     multiplier = 1.0
@@ -44,7 +44,7 @@ def _parse_video_timestamp(value) -> float | None:
             total_seconds += amount * multiplier
             multiplier *= 60.0
     except ValueError as exc:
-        raise ValueError("视频时间点格式不正确，支持 1.2 或 00:01.2") from exc
+        raise ValueError("视频时间点格式不太对，可以填 2、10.5 或 01:23") from exc
 
     return total_seconds
 
@@ -71,7 +71,9 @@ def api_capture():
     video_time = payload.get("videoTime")
     show_browser = bool(payload.get("showBrowser"))
     dark_mode = payload.get("darkMode")
+    translate_body = payload.get("translateBody")
     dark_mode = True if dark_mode is None else bool(dark_mode)
+    translate_body = True if translate_body is None else bool(translate_body)
 
     if not url:
         return jsonify({"ok": False, "error": "请输入推文链接"}), 400
@@ -93,6 +95,7 @@ def api_capture():
             headless=not show_browser,
             dark_mode=dark_mode,
             video_timestamp_seconds=video_timestamp_seconds,
+            translate_body=translate_body,
         ).result()
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400

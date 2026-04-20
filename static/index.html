@@ -282,6 +282,7 @@
       <h1>输入一条 X / Twitter 链接，自动生成详情页截图</h1>
       <p class="lead">
         截图会直接保存到当前工具文件夹里的 <code>screenshots/</code> 目录。
+        如果帖子正文不是中文，可以勾选“追加正文中文翻译”，让图片里同时保留原文和中文翻译。
         如果某些推文需要登录才能访问，可以勾选“显示浏览器”，在打开的浏览器里完成登录后再截图。
       </p>
     </section>
@@ -296,8 +297,8 @@
 
         <div class="subfield">
           <label class="label" for="videoTime">视频时间点（可选）</label>
-          <input id="videoTime" type="text" placeholder="例如 1.2 或 00:01.2，仅对包含视频的推文生效" autocomplete="off">
-          <p class="hint">留空时会自动尝试避开视频开头的封面帧或黑帧；如果你想要精确截到某个画面，直接填时间点即可。</p>
+          <input id="videoTime" type="text" placeholder="例如 2、10.5 或 01:23" autocomplete="off">
+          <p class="hint">如果推文里有视频，可以直接填想截取的时间点。比如填 `2` 表示第 2 秒，填 `10.5` 表示第 10.5 秒，也可以用 `01:23` 这样的分:秒格式。留空也没关系，工具会自动帮你尽量避开开头的封面帧或黑帧。</p>
         </div>
 
         <label class="toggle">
@@ -310,6 +311,11 @@
           <span>夜间模式截图。默认按暗色主题抓取推文，适合直接保存成深色视觉稿。</span>
         </label>
 
+        <label class="toggle">
+          <input id="translateBody" type="checkbox" checked>
+          <span>追加正文中文翻译。只处理帖子正文，保留原文，不翻译作者名、时间和互动数据。</span>
+        </label>
+
         <div id="status" class="status"></div>
       </div>
 
@@ -319,7 +325,8 @@
           <ul>
             <li>支持 `x.com`、`twitter.com`、`mobile.twitter.com` 的单条推文链接。</li>
             <li>默认优先截取推文详情页；如果详情页无法加载，会自动回退到嵌入卡片截图。</li>
-            <li>视频推文支持填写时间点，格式可用 `1.2` 或 `00:01.2`。</li>
+            <li>勾选“追加正文中文翻译”后，会保留原文并在下方追加中文翻译；作者名、时间等信息不会翻译。</li>
+            <li>如果推文里有视频，可以直接填时间点，比如 `2`、`10.5`，或者 `01:23`。</li>
             <li>截图文件会带上推文 ID 和时间戳，方便反复保存不覆盖。</li>
           </ul>
         </div>
@@ -355,6 +362,7 @@
     const videoTime = document.getElementById('videoTime');
     const showBrowser = document.getElementById('showBrowser');
     const darkMode = document.getElementById('darkMode');
+    const translateBody = document.getElementById('translateBody');
     const status = document.getElementById('status');
     const resultCard = document.getElementById('resultCard');
     const emptyState = document.getElementById('emptyState');
@@ -412,7 +420,8 @@
             url,
             videoTime: videoTime.value.trim(),
             showBrowser: showBrowser.checked,
-            darkMode: darkMode.checked
+            darkMode: darkMode.checked,
+            translateBody: translateBody.checked
           })
         });
 
