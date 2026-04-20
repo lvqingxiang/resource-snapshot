@@ -108,6 +108,7 @@ class CaptureResult:
     capture_mode: str
     used_url: str
     tweet_id: str
+    video_frame_seconds: float | None
 
 
 def _normalize_input_url(url: str) -> str:
@@ -275,7 +276,319 @@ def _wait_for_tweet_assets(page, tweet_card) -> None:
     except PlaywrightTimeoutError:
         pass
 
+    try:
+        page.wait_for_function(
+            """
+            (el) => {
+              const videos = [...el.querySelectorAll('video')].filter((video) => {
+                const style = window.getComputedStyle(video);
+                if (!style) {
+                  return false;
+                }
+                if (style.display === 'none' || style.visibility === 'hidden') {
+                  return false;
+                }
+                const rect = video.getBoundingClientRect();
+                return rect.width >= 48 && rect.height >= 48;
+              });
+              return videos.length === 0 || videos.every((video) => video.readyState >= 1);
+            }
+            """,
+            arg=element,
+            timeout=6000,
+        )
+    except PlaywrightTimeoutError:
+        pass
+
     page.wait_for_timeout(1200)
+
+
+def _prepare_video_frame(tweet_card, target_seconds: float | None) -> float | None:
+    try:
+        result = tweet_card.evaluate(
+            """
+            async (root, targetSeconds) => {
+              const isVisible = (node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style) {
+                  return false;
+                }
+                if (style.display === 'none' || style.visibility === 'hidden') {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width >= 48 && rect.height >= 48;
+              };
+
+              const wait = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+              const waitUntil = async (predicate, timeoutMs) => {
+                const deadline = Date.now() + timeoutMs;
+                while (Date.now() < deadline) {
+                  try {
+                    if (predicate()) {
+                      return true;
+                    }
+                  } catch (error) {
+                  }
+                  await wait(80);
+                }
+                return false;
+              };
+
+              const once = (target, eventName, timeoutMs) =>
+                new Promise((resolve) => {
+                  let settled = false;
+                  const finish = () => {
+                    if (settled) {
+                      return;
+                    }
+                    settled = true;
+                    target.removeEventListener(eventName, onEvent);
+                    window.clearTimeout(timer);
+                    resolve();
+                  };
+                  const onEvent = () => finish();
+                  const timer = window.setTimeout(finish, timeoutMs);
+                  target.addEventListener(eventName, onEvent, { once: true });
+                });
+
+              const videos = [...root.querySelectorAll('video')]
+                .filter((video) => isVisible(video))
+                .map((video) => {
+                  const rect = video.getBoundingClientRect();
+                  return { video, area: rect.width * rect.height };
+                })
+                .sort((a, b) => b.area - a.area);
+
+              if (videos.length === 0) {
+                return null;
+              }
+
+              const video = videos[0].video;
+              video.muted = true;
+              video.defaultMuted = true;
+              video.playsInline = true;
+              video.preload = 'auto';
+              video.controls = false;
+
+              const playerRoot =
+                video.closest('[data-testid="videoComponent"]') ||
+                video.closest('[data-testid="videoPlayer"]') ||
+                video.parentElement ||
+                root;
+
+              const activatePlayer = () => {
+                const candidates = [
+                  playerRoot?.querySelector('button[aria-label*="Play"]'),
+                  playerRoot?.querySelector('button[aria-label*="播放"]'),
+                  playerRoot?.querySelector('[role="button"][aria-label*="Play"]'),
+                  playerRoot?.querySelector('[role="button"][aria-label*="播放"]'),
+                  playerRoot?.querySelector('button'),
+                  video,
+                ].filter(Boolean);
+                for (const node of candidates) {
+                  try {
+                    if (node instanceof HTMLElement) {
+                      node.click();
+                      return true;
+                    }
+                  } catch (error) {
+                  }
+                }
+                return false;
+              };
+
+              const ensureMetadata = async () => {
+                if (video.readyState >= 1) {
+                  return;
+                }
+                if (video.readyState === 0 && typeof video.load === 'function') {
+                  try {
+                    video.load();
+                  } catch (error) {
+                  }
+                }
+                await Promise.race([
+                  once(video, 'loadedmetadata', 5000),
+                  once(video, 'durationchange', 5000),
+                  once(video, 'loadeddata', 5000),
+                ]);
+              };
+
+              const playFor = async (ms) => {
+                try {
+                  activatePlayer();
+                  const playPromise = video.play();
+                  if (playPromise && typeof playPromise.then === 'function') {
+                    await Promise.race([playPromise.catch(() => undefined), wait(250)]);
+                  } else {
+                    await wait(250);
+                  }
+                } catch (error) {
+                }
+                await wait(ms);
+              };
+
+              const pauseVideo = () => {
+                try {
+                  video.pause();
+                } catch (error) {
+                }
+              };
+
+              const warmUp = async () => {
+                try {
+                  await playFor(650);
+                } finally {
+                  pauseVideo();
+                  await wait(140);
+                }
+              };
+
+              const clampTime = (value, duration) => {
+                if (!Number.isFinite(value) || value < 0) {
+                  return 0;
+                }
+                if (duration === null) {
+                  return value;
+                }
+                return Math.min(value, Math.max(duration - 0.12, 0));
+              };
+
+              const seekTo = async (value, duration) => {
+                const nextTime = clampTime(value, duration);
+                if (Math.abs((video.currentTime || 0) - nextTime) <= 0.04) {
+                  return nextTime;
+                }
+                try {
+                  const seekPromise = Promise.race([
+                    once(video, 'seeking', 1200),
+                    once(video, 'seeked', 3500),
+                    once(video, 'timeupdate', 3500),
+                  ]);
+                  video.currentTime = nextTime;
+                  await seekPromise;
+                  await waitUntil(
+                    () => Math.abs((video.currentTime || 0) - nextTime) <= 0.18,
+                    1500,
+                  );
+                } catch (error) {
+                }
+                return nextTime;
+              };
+
+              const hideVideoOverlays = () => {
+                const videoRect = video.getBoundingClientRect();
+                const videoArea = videoRect.width * videoRect.height;
+                if (videoArea < 1) {
+                  return;
+                }
+
+                const overlapRatio = (rect) => {
+                  const width = Math.max(0, Math.min(videoRect.right, rect.right) - Math.max(videoRect.left, rect.left));
+                  const height = Math.max(0, Math.min(videoRect.bottom, rect.bottom) - Math.max(videoRect.top, rect.top));
+                  return (width * height) / videoArea;
+                };
+
+                const overlayNodes = playerRoot
+                  ? playerRoot.querySelectorAll('img, button, [role="button"], svg')
+                  : [];
+
+                overlayNodes.forEach((node) => {
+                  if (!(node instanceof HTMLElement) || node === video || node.contains(video)) {
+                    return;
+                  }
+                  const rect = node.getBoundingClientRect();
+                  if (rect.width < 20 || rect.height < 20) {
+                    return;
+                  }
+                  if (overlapRatio(rect) < 0.55) {
+                    return;
+                  }
+                  node.style.opacity = '0';
+                  node.style.pointerEvents = 'none';
+                });
+              };
+
+              const renderTargetFrame = async (desiredTime, duration) => {
+                try {
+                  activatePlayer();
+                  const playPromise = video.play();
+                  if (playPromise && typeof playPromise.then === 'function') {
+                    await Promise.race([playPromise.catch(() => undefined), wait(250)]);
+                  } else {
+                    await wait(180);
+                  }
+
+                  await waitUntil(
+                    () => {
+                      const current = video.currentTime || 0;
+                      return current >= Math.max(desiredTime - 0.12, 0);
+                    },
+                    1800,
+                  );
+                } catch (error) {
+                } finally {
+                  pauseVideo();
+                  await wait(160);
+                }
+
+                if (Math.abs((video.currentTime || 0) - desiredTime) > 0.35) {
+                  await seekTo(desiredTime, duration);
+                  pauseVideo();
+                  await wait(120);
+                }
+              };
+
+              await ensureMetadata();
+              if (video.readyState < 2) {
+                await warmUp();
+              }
+
+              const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : null;
+              let desiredTime = null;
+              if (Number.isFinite(targetSeconds) && targetSeconds >= 0) {
+                desiredTime = targetSeconds;
+              } else if (duration !== null) {
+                desiredTime = Math.min(
+                  Math.max(duration * 0.18, 0.8),
+                  3.5,
+                  Math.max(duration - 0.12, 0),
+                );
+              } else {
+                desiredTime = 0.8;
+              }
+
+              desiredTime = clampTime(desiredTime, duration);
+              await seekTo(desiredTime, duration);
+              if (video.readyState < 2) {
+                await warmUp();
+                await seekTo(desiredTime, duration);
+              }
+
+              await renderTargetFrame(desiredTime, duration);
+              if (Math.abs((video.currentTime || 0) - desiredTime) > 0.35) {
+                await seekTo(desiredTime, duration);
+                await renderTargetFrame(desiredTime, duration);
+              }
+
+              hideVideoOverlays();
+              await wait(160);
+              return Number.isFinite(video.currentTime) ? video.currentTime : desiredTime;
+            }
+            """,
+            target_seconds,
+        )
+    except Exception:
+        return None
+
+    if isinstance(result, (int, float)):
+        return max(0.0, float(result))
+    return None
 
 
 def _compute_capture_clip(page, tweet_card):
@@ -454,6 +767,7 @@ def capture_tweet_page(
     *,
     headless: bool = True,
     dark_mode: bool = True,
+    video_timestamp_seconds: float | None = None,
 ) -> CaptureResult:
     normalized_url = _normalize_input_url(url)
     screen_name, tweet_id = _extract_parts(normalized_url)
@@ -468,6 +782,7 @@ def capture_tweet_page(
     saved_to = output_path / file_name
     used_url = ""
     capture_mode = ""
+    video_frame_seconds = None
     wait_timeout_ms = 90000 if not headless else 25000
 
     with sync_playwright() as playwright:
@@ -519,6 +834,7 @@ def capture_tweet_page(
                     _dismiss_common_overlays(page)
                     _scroll_tweet_into_view(page, tweet_card)
                     _wait_for_tweet_assets(page, tweet_card)
+                    video_frame_seconds = _prepare_video_frame(tweet_card, video_timestamp_seconds)
 
                     used_url = active_url
                     capture_mode = mode
@@ -552,4 +868,5 @@ def capture_tweet_page(
         capture_mode=capture_mode,
         used_url=used_url,
         tweet_id=tweet_id,
+        video_frame_seconds=video_frame_seconds,
     )

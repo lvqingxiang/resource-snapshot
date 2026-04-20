@@ -25,6 +25,30 @@ _RUN_LOCK = threading.Lock()
 _EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tweet-shot")
 
 
+def _parse_video_timestamp(value) -> float | None:
+    raw = "" if value is None else str(value).strip()
+    if not raw:
+        return None
+
+    parts = raw.split(":")
+    if len(parts) > 3 or any(part.strip() == "" for part in parts):
+        raise ValueError("视频时间点格式不正确，支持 1.2 或 00:01.2")
+
+    total_seconds = 0.0
+    multiplier = 1.0
+    try:
+        for part in reversed(parts):
+            amount = float(part)
+            if amount < 0:
+                raise ValueError
+            total_seconds += amount * multiplier
+            multiplier *= 60.0
+    except ValueError as exc:
+        raise ValueError("视频时间点格式不正确，支持 1.2 或 00:01.2") from exc
+
+    return total_seconds
+
+
 @app.get("/")
 def index():
     return send_from_directory(ROOT / "static", "index.html")
@@ -44,12 +68,18 @@ def screenshots(filename: str):
 def api_capture():
     payload = request.get_json(silent=True) or {}
     url = (payload.get("url") or "").strip()
+    video_time = payload.get("videoTime")
     show_browser = bool(payload.get("showBrowser"))
     dark_mode = payload.get("darkMode")
     dark_mode = True if dark_mode is None else bool(dark_mode)
 
     if not url:
         return jsonify({"ok": False, "error": "请输入推文链接"}), 400
+
+    try:
+        video_timestamp_seconds = _parse_video_timestamp(video_time)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
 
     if not _RUN_LOCK.acquire(blocking=False):
         return jsonify({"ok": False, "error": "已有截图任务在运行，请稍后再试"}), 429
@@ -62,6 +92,7 @@ def api_capture():
             PROFILE_DIR,
             headless=not show_browser,
             dark_mode=dark_mode,
+            video_timestamp_seconds=video_timestamp_seconds,
         ).result()
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
@@ -80,6 +111,7 @@ def api_capture():
             "captureMode": result.capture_mode,
             "usedUrl": result.used_url,
             "tweetId": result.tweet_id,
+            "videoFrameSeconds": result.video_frame_seconds,
         }
     )
 
