@@ -106,7 +106,8 @@
     }
 
     input[type="url"],
-    input[type="text"] {
+    input[type="text"],
+    textarea {
       flex: 1;
       min-width: 240px;
       padding: 16px 18px;
@@ -120,9 +121,18 @@
     }
 
     input[type="url"]:focus,
-    input[type="text"]:focus {
+    input[type="text"]:focus,
+    textarea:focus {
       border-color: rgba(110, 193, 255, 0.74);
       transform: translateY(-1px);
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 108px;
+      resize: vertical;
+      font: inherit;
+      line-height: 1.6;
     }
 
     .subfield {
@@ -162,6 +172,24 @@
       box-shadow: none;
     }
 
+    .button-secondary {
+      background: rgba(8, 20, 31, 0.78);
+      color: var(--text);
+      border: 1px solid rgba(110, 193, 255, 0.28);
+      box-shadow: none;
+    }
+
+    .button-secondary:hover {
+      box-shadow: 0 14px 28px rgba(0, 0, 0, 0.18);
+    }
+
+    .actions {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+    }
+
     .toggle {
       display: flex;
       align-items: flex-start;
@@ -198,7 +226,8 @@
     }
 
     .tips h2,
-    .result h2 {
+    .result h2,
+    .review h2 {
       margin: 0 0 14px;
       font-size: 18px;
       letter-spacing: -0.02em;
@@ -214,6 +243,123 @@
 
     .result {
       padding: 24px;
+    }
+
+    .stack {
+      display: grid;
+      gap: 22px;
+      align-items: start;
+    }
+
+    .review {
+      display: none;
+      padding: 24px;
+    }
+
+    .review.show {
+      display: block;
+    }
+
+    .review-header {
+      display: grid;
+      gap: 8px;
+    }
+
+    .review-list {
+      display: grid;
+      gap: 14px;
+      margin-top: 16px;
+    }
+
+    .review-item {
+      padding: 16px;
+      border-radius: 18px;
+      border: 1px solid rgba(173, 216, 255, 0.12);
+      background: rgba(5, 15, 25, 0.52);
+      display: grid;
+      gap: 14px;
+    }
+
+    .review-item-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .review-item h3 {
+      margin: 0;
+      font-size: 15px;
+      color: var(--accent-2);
+    }
+
+    .review-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      align-items: start;
+    }
+
+    .review-block {
+      min-width: 0;
+    }
+
+    .review-block-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+
+    .review-caption {
+      font-size: 12px;
+      color: var(--muted);
+      letter-spacing: 0.02em;
+    }
+
+    .review-copy {
+      min-width: 0;
+      padding: 8px 12px;
+      border-radius: 12px;
+      font-size: 13px;
+      box-shadow: none;
+    }
+
+    .review-copy.copied {
+      background: rgba(152, 229, 180, 0.14);
+      color: var(--success);
+      border-color: rgba(152, 229, 180, 0.22);
+    }
+
+    .review-source,
+    .review-translation {
+      white-space: pre-wrap;
+      line-height: 1.7;
+      color: var(--text);
+      font-size: 14px;
+    }
+
+    .review-source {
+      min-height: 148px;
+      max-height: 220px;
+      overflow: auto;
+      padding: 14px 16px;
+      border-radius: 16px;
+      border: 1px solid rgba(126, 177, 214, 0.18);
+      background: rgba(9, 24, 36, 0.78);
+    }
+
+    .review-translation {
+      min-height: 148px;
+    }
+
+    .action-note {
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
     }
 
     .result-card {
@@ -269,6 +415,10 @@
         grid-template-columns: 1fr;
       }
 
+      .review-grid {
+        grid-template-columns: 1fr;
+      }
+
       button {
         width: 100%;
       }
@@ -282,87 +432,101 @@
       <h1>输入一条 X / Twitter 链接，自动生成详情页截图</h1>
       <p class="lead">
         截图会直接保存到当前工具文件夹里的 <code>screenshots/</code> 目录。
-        如果帖子正文不是中文，可以勾选“追加正文中文翻译”，让图片里同时保留原文和中文翻译。
+        如果帖子正文不是中文，可以先点“获取翻译”单独检查正文和中文内容。
+        确认无误后再点“开始截图”，就会把翻译一并带进最终图片；如果一开始直接点截图，则只生成原图。
         如果某些推文需要登录才能访问，可以勾选“显示浏览器”，在打开的浏览器里完成登录后再截图。
       </p>
     </section>
 
     <section class="grid">
-      <div class="card panel">
-        <label class="label" for="url">推文链接</label>
-        <div class="row">
-          <input id="url" type="url" placeholder="例如 https://x.com/username/status/1234567890" autocomplete="off">
-          <button id="captureBtn">开始截图</button>
+      <div class="stack">
+        <div class="card panel">
+          <label class="label" for="url">推文链接</label>
+          <div class="row">
+            <input id="url" type="url" placeholder="例如 https://x.com/username/status/1234567890" autocomplete="off">
+          </div>
+          <div class="actions">
+            <button id="translateBtn" class="button-secondary">获取翻译</button>
+            <button id="captureBtn">开始截图</button>
+          </div>
+          <p class="action-note">直接点“开始截图”会生成原图。先点“获取翻译”，确认内容后再点“开始截图”，则会把翻译一并带进最终图片。</p>
+
+          <div class="subfield">
+            <label class="label" for="videoTime">视频时间点（可选）</label>
+            <input id="videoTime" type="text" placeholder="例如 2、10.5 或 01:23" autocomplete="off">
+            <p class="hint">如果推文里有视频，可以直接填想截取的时间点。比如填 `2` 表示第 2 秒，填 `10.5` 表示第 10.5 秒，也可以用 `01:23` 这样的分:秒格式。留空也没关系，工具会自动帮你尽量避开开头的封面帧或黑帧。</p>
+          </div>
+
+          <label class="toggle">
+            <input id="showBrowser" type="checkbox">
+            <span>显示浏览器。如果这条推文需要登录查看，勾选后可以先在可见浏览器里登录 X，再继续截图。</span>
+          </label>
+
+          <label class="toggle">
+            <input id="darkMode" type="checkbox" checked>
+            <span>夜间模式截图。默认按暗色主题抓取推文，适合直接保存成深色视觉稿。</span>
+          </label>
+
+          <div id="status" class="status"></div>
         </div>
 
-        <div class="subfield">
-          <label class="label" for="videoTime">视频时间点（可选）</label>
-          <input id="videoTime" type="text" placeholder="例如 2、10.5 或 01:23" autocomplete="off">
-          <p class="hint">如果推文里有视频，可以直接填想截取的时间点。比如填 `2` 表示第 2 秒，填 `10.5` 表示第 10.5 秒，也可以用 `01:23` 这样的分:秒格式。留空也没关系，工具会自动帮你尽量避开开头的封面帧或黑帧。</p>
-        </div>
-
-        <label class="toggle">
-          <input id="showBrowser" type="checkbox">
-          <span>显示浏览器。如果这条推文需要登录查看，勾选后可以先在可见浏览器里登录 X，再继续截图。</span>
-        </label>
-
-        <label class="toggle">
-          <input id="darkMode" type="checkbox" checked>
-          <span>夜间模式截图。默认按暗色主题抓取推文，适合直接保存成深色视觉稿。</span>
-        </label>
-
-        <label class="toggle">
-          <input id="translateBody" type="checkbox" checked>
-          <span>追加正文中文翻译。只处理帖子正文，保留原文，不翻译作者名、时间和互动数据。</span>
-        </label>
-
-        <div id="status" class="status"></div>
+        <section id="translationReview" class="card review">
+          <div class="review-header">
+            <h2>翻译确认</h2>
+            <p id="reviewHint" class="empty">点击“获取翻译”后，这里会显示逐段原文和可编辑中文。随后点击“开始截图”会把这里的内容带进最终图片。</p>
+          </div>
+          <div id="translationList" class="review-list"></div>
+        </section>
       </div>
 
-      <aside class="card panel tips">
-        <div>
-          <h2>使用说明</h2>
-          <ul>
-            <li>支持 `x.com`、`twitter.com`、`mobile.twitter.com` 的单条推文链接。</li>
-            <li>默认优先截取推文详情页；如果详情页无法加载，会自动回退到嵌入卡片截图。</li>
-            <li>勾选“追加正文中文翻译”后，会保留原文并在下方追加中文翻译；作者名、时间等信息不会翻译。</li>
-            <li>如果推文里有视频，可以直接填时间点，比如 `2`、`10.5`，或者 `01:23`。</li>
-            <li>截图文件会带上推文 ID 和时间戳，方便反复保存不覆盖。</li>
-          </ul>
+      <section class="card result">
+        <h2>最近一次截图</h2>
+        <p id="emptyState" class="empty">还没有生成截图。输入链接后，预览会显示在这里。</p>
+        <div id="resultCard" class="result-card">
+          <div class="preview">
+            <img id="previewImage" alt="推文截图预览">
+          </div>
+          <div class="meta">
+            <div>文件名：<code id="fileName"></code></div>
+            <div>保存路径：<code id="savedTo"></code></div>
+            <div>截图模式：<code id="captureMode"></code></div>
+            <div id="videoFrameRow" hidden>视频画面：<code id="videoFrame"></code></div>
+            <div>实际访问：<a id="usedUrl" href="#" target="_blank" rel="noreferrer">打开链接</a></div>
+            <div><a id="openImage" href="#" target="_blank" rel="noreferrer">在新标签页打开图片</a></div>
+          </div>
         </div>
-        <div>
-          <h2>保存位置</h2>
-          <p class="empty" id="saveHint"></p>
-        </div>
-      </aside>
+      </section>
     </section>
 
-    <section class="card result" style="margin-top: 22px;">
-      <h2>最近一次截图</h2>
-      <p id="emptyState" class="empty">还没有生成截图。输入链接后，预览会显示在这里。</p>
-      <div id="resultCard" class="result-card">
-        <div class="preview">
-          <img id="previewImage" alt="推文截图预览">
-        </div>
-        <div class="meta">
-          <div>文件名：<code id="fileName"></code></div>
-          <div>保存路径：<code id="savedTo"></code></div>
-          <div>截图模式：<code id="captureMode"></code></div>
-          <div id="videoFrameRow" hidden>视频画面：<code id="videoFrame"></code></div>
-          <div>实际访问：<a id="usedUrl" href="#" target="_blank" rel="noreferrer">打开链接</a></div>
-          <div><a id="openImage" href="#" target="_blank" rel="noreferrer">在新标签页打开图片</a></div>
-        </div>
+    <section class="card panel tips" style="margin-top: 22px;">
+      <div>
+        <h2>使用说明</h2>
+        <ul>
+          <li>支持 `x.com`、`twitter.com`、`mobile.twitter.com` 的单条推文链接。</li>
+          <li>默认优先截取推文详情页；如果详情页无法加载，会自动回退到嵌入卡片截图。</li>
+          <li>直接点击“开始截图”会生成原图；先点“获取翻译”再截图，会把确认后的中文一并放进图片。</li>
+          <li>翻译确认区里可以逐段修改中文，也可以一键复制原文去第三方翻译；作者名、时间等信息不会被翻译。</li>
+          <li>如果推文里有视频，可以直接填时间点，比如 `2`、`10.5`，或者 `01:23`。</li>
+          <li>截图文件会带上推文 ID 和时间戳，方便反复保存不覆盖。</li>
+        </ul>
+      </div>
+      <div>
+        <h2>保存位置</h2>
+        <p class="empty" id="saveHint"></p>
       </div>
     </section>
   </main>
 
   <script>
-    const btn = document.getElementById('captureBtn');
+    const translateBtn = document.getElementById('translateBtn');
+    const captureBtn = document.getElementById('captureBtn');
     const input = document.getElementById('url');
     const videoTime = document.getElementById('videoTime');
     const showBrowser = document.getElementById('showBrowser');
     const darkMode = document.getElementById('darkMode');
-    const translateBody = document.getElementById('translateBody');
+    const translationReview = document.getElementById('translationReview');
+    const reviewHint = document.getElementById('reviewHint');
+    const translationList = document.getElementById('translationList');
     const status = document.getElementById('status');
     const resultCard = document.getElementById('resultCard');
     const emptyState = document.getElementById('emptyState');
@@ -375,6 +539,8 @@
     const usedUrl = document.getElementById('usedUrl');
     const openImage = document.getElementById('openImage');
     const saveHint = document.getElementById('saveHint');
+    let translationDraft = [];
+    let translationPrepared = false;
 
     saveHint.textContent = '当前工具文件夹里的 screenshots/ 子目录';
 
@@ -402,6 +568,224 @@
       return `${String(minutes).padStart(2, '0')}:${secondsText}`;
     }
 
+    function getBasePayload() {
+      return {
+        url: input.value.trim(),
+        videoTime: videoTime.value.trim(),
+        showBrowser: showBrowser.checked,
+        darkMode: darkMode.checked
+      };
+    }
+
+    function setBusy(isBusy) {
+      translateBtn.disabled = isBusy;
+      captureBtn.disabled = isBusy;
+    }
+
+    function resetTranslationReview() {
+      translationDraft = [];
+      translationPrepared = false;
+      translationList.innerHTML = '';
+      reviewHint.textContent = '点击“获取翻译”后，这里会显示逐段原文和可编辑中文。随后点击“开始截图”会把这里的内容带进最终图片。';
+      translationReview.classList.remove('show');
+      translateBtn.textContent = '获取翻译';
+    }
+
+    async function copyText(text, button) {
+      const value = text || '';
+      if (!value) {
+        return;
+      }
+
+      const originalLabel = button.textContent;
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(value);
+        } else {
+          const helper = document.createElement('textarea');
+          helper.value = value;
+          helper.setAttribute('readonly', 'readonly');
+          helper.style.position = 'fixed';
+          helper.style.opacity = '0';
+          document.body.appendChild(helper);
+          helper.select();
+          document.execCommand('copy');
+          document.body.removeChild(helper);
+        }
+
+        button.textContent = '已复制';
+        button.classList.add('copied');
+        window.setTimeout(() => {
+          button.textContent = originalLabel;
+          button.classList.remove('copied');
+        }, 1400);
+      } catch (error) {
+        setStatus('复制原文失败，请手动选中复制', 'error');
+      }
+    }
+
+    function renderTranslationReview() {
+      translationList.innerHTML = '';
+      translationReview.classList.add('show');
+
+      if (!translationDraft.length) {
+        reviewHint.textContent = '没有检测到需要翻译的正文。现在直接点击“开始截图”即可生成原图。';
+        return;
+      }
+
+      reviewHint.textContent = '下面会按正文出现顺序列出原文和对应中文。你可以复制原文去第三方翻译，也可以直接修改右侧中文；然后点击“开始截图”生成最终图片。';
+
+      translationDraft.forEach((item, position) => {
+        const card = document.createElement('div');
+        card.className = 'review-item';
+
+        const head = document.createElement('div');
+        head.className = 'review-item-head';
+
+        const title = document.createElement('h3');
+        title.textContent = item.label || `第 ${position + 1} 段正文`;
+
+        head.append(title);
+
+        const contentGrid = document.createElement('div');
+        contentGrid.className = 'review-grid';
+
+        const sourceBlock = document.createElement('div');
+        sourceBlock.className = 'review-block';
+
+        const sourceHead = document.createElement('div');
+        sourceHead.className = 'review-block-head';
+
+        const sourceLabel = document.createElement('span');
+        sourceLabel.className = 'review-caption';
+        sourceLabel.textContent = '原文';
+
+        const copyBtn = document.createElement('button');
+        copyBtn.type = 'button';
+        copyBtn.className = 'button-secondary review-copy';
+        copyBtn.textContent = '复制原文';
+        copyBtn.addEventListener('click', async () => {
+          await copyText(item.originalText, copyBtn);
+        });
+
+        sourceHead.append(sourceLabel, copyBtn);
+
+        const source = document.createElement('div');
+        source.className = 'review-source';
+        source.textContent = item.originalText;
+
+        sourceBlock.append(sourceHead, source);
+
+        const translationBlock = document.createElement('div');
+        translationBlock.className = 'review-block';
+
+        const translationHead = document.createElement('div');
+        translationHead.className = 'review-block-head';
+
+        const translationLabel = document.createElement('span');
+        translationLabel.className = 'review-caption';
+        translationLabel.textContent = '中文翻译';
+
+        translationHead.append(translationLabel);
+
+        const textarea = document.createElement('textarea');
+        textarea.className = 'review-translation';
+        textarea.value = item.translation || '';
+        textarea.placeholder = '这里可以直接修改这一段的中文翻译';
+        textarea.addEventListener('input', () => {
+          item.translation = textarea.value;
+        });
+
+        translationBlock.append(translationHead, textarea);
+        contentGrid.append(sourceBlock, translationBlock);
+        card.append(head, contentGrid);
+        translationList.append(card);
+      });
+
+      translationReview.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    function updateResult(data) {
+      const previewUrl = `${data.previewUrl}?t=${Date.now()}`;
+      previewImage.src = previewUrl;
+      previewImage.alt = `推文截图 ${data.fileName}`;
+      fileName.textContent = data.fileName;
+      savedTo.textContent = data.savedTo;
+      captureMode.textContent = data.captureMode === 'detail_page' ? '详情页截图' : '嵌入卡片截图';
+      if (typeof data.videoFrameSeconds === 'number') {
+        videoFrame.textContent = formatVideoTime(data.videoFrameSeconds);
+        videoFrameRow.hidden = false;
+      } else {
+        videoFrame.textContent = '';
+        videoFrameRow.hidden = true;
+      }
+      usedUrl.href = data.usedUrl;
+      usedUrl.textContent = data.usedUrl;
+      openImage.href = previewUrl;
+
+      emptyState.style.display = 'none';
+      resultCard.classList.add('show');
+    }
+
+    async function requestCapture(payload) {
+      const response = await fetch('/api/capture', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.ok) {
+        throw new Error(data.error || '截图失败');
+      }
+      return data;
+    }
+
+    async function prepareTranslations() {
+      const url = input.value.trim();
+      if (!url) {
+        setStatus('请输入推文链接', 'error');
+        return;
+      }
+
+      setBusy(true);
+      setStatus('正在获取需要翻译的正文，请稍候...', '');
+
+      try {
+        const response = await fetch('/api/preview-translations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(getBasePayload())
+        });
+
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data.ok) {
+          throw new Error(data.error || '获取翻译内容失败');
+        }
+
+        translationDraft = (data.items || []).map((item) => ({
+          index: item.index,
+          label: item.label,
+          originalText: item.originalText || '',
+          translation: item.translation || ''
+        }));
+        translationPrepared = true;
+        renderTranslationReview();
+        translateBtn.textContent = '重新获取翻译';
+        setStatus(
+          translationDraft.length
+            ? '翻译内容已经准备好了。现在点击“开始截图”会把这里的中文带进最终图片。'
+            : '没有检测到需要翻译的正文。现在直接点击“开始截图”即可。',
+          'success'
+        );
+      } catch (error) {
+        resetTranslationReview();
+        setStatus(error.message || '获取翻译内容失败', 'error');
+      } finally {
+        setBusy(false);
+      }
+    }
+
     async function capture() {
       const url = input.value.trim();
       if (!url) {
@@ -409,59 +793,43 @@
         return;
       }
 
-      btn.disabled = true;
-      setStatus('正在生成截图，请稍候...', '');
+      setBusy(true);
+      setStatus(
+        translationPrepared ? '正在生成带翻译的截图，请稍候...' : '正在生成截图，请稍候...',
+        ''
+      );
 
       try {
-        const response = await fetch('/api/capture', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            url,
-            videoTime: videoTime.value.trim(),
-            showBrowser: showBrowser.checked,
-            darkMode: darkMode.checked,
-            translateBody: translateBody.checked
-          })
-        });
-
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok || !data.ok) {
-          throw new Error(data.error || '截图失败');
+        const payload = getBasePayload();
+        payload.translateBody = translationPrepared;
+        if (translationPrepared) {
+          payload.translationOverrides = translationDraft.map((item) => ({
+            index: item.index,
+            translation: item.translation || ''
+          }));
         }
 
-        const previewUrl = `${data.previewUrl}?t=${Date.now()}`;
-        previewImage.src = previewUrl;
-        previewImage.alt = `推文截图 ${data.fileName}`;
-        fileName.textContent = data.fileName;
-        savedTo.textContent = data.savedTo;
-        captureMode.textContent = data.captureMode === 'detail_page' ? '详情页截图' : '嵌入卡片截图';
-        if (typeof data.videoFrameSeconds === 'number') {
-          videoFrame.textContent = formatVideoTime(data.videoFrameSeconds);
-          videoFrameRow.hidden = false;
-        } else {
-          videoFrame.textContent = '';
-          videoFrameRow.hidden = true;
-        }
-        usedUrl.href = data.usedUrl;
-        usedUrl.textContent = data.usedUrl;
-        openImage.href = previewUrl;
-
-        emptyState.style.display = 'none';
-        resultCard.classList.add('show');
+        const data = await requestCapture(payload);
+        updateResult(data);
         setStatus(data.message || '截图已保存', 'success');
       } catch (error) {
         setStatus(error.message || '截图失败', 'error');
       } finally {
-        btn.disabled = false;
+        setBusy(false);
       }
     }
 
-    btn.addEventListener('click', capture);
+    translateBtn.addEventListener('click', prepareTranslations);
+    captureBtn.addEventListener('click', capture);
     input.addEventListener('keydown', (event) => {
       if (event.key === 'Enter') {
         capture();
       }
+    });
+
+    [input, videoTime, showBrowser, darkMode].forEach((element) => {
+      element.addEventListener('input', resetTranslationReview);
+      element.addEventListener('change', resetTranslationReview);
     });
   </script>
 </body>

@@ -11,7 +11,7 @@ import webbrowser
 
 from flask import Flask, jsonify, request, send_from_directory
 
-from screenshot_service import capture_tweet_page
+from screenshot_service import capture_tweet_page, preview_tweet_translations
 
 
 ROOT = Path(__file__).resolve().parent
@@ -69,11 +69,24 @@ def api_capture():
     payload = request.get_json(silent=True) or {}
     url = (payload.get("url") or "").strip()
     video_time = payload.get("videoTime")
+    custom_translation = (payload.get("customTranslation") or "").strip()
+    translation_overrides_payload = payload.get("translationOverrides") or []
     show_browser = bool(payload.get("showBrowser"))
     dark_mode = payload.get("darkMode")
     translate_body = payload.get("translateBody")
     dark_mode = True if dark_mode is None else bool(dark_mode)
-    translate_body = True if translate_body is None else bool(translate_body)
+    translate_body = False if translate_body is None else bool(translate_body)
+    translation_overrides: dict[int, str] = {}
+
+    if isinstance(translation_overrides_payload, list):
+        for item in translation_overrides_payload:
+            if not isinstance(item, dict):
+                continue
+            try:
+                index = int(item.get("index"))
+            except (TypeError, ValueError):
+                continue
+            translation_overrides[index] = str(item.get("translation") or "")
 
     if not url:
         return jsonify({"ok": False, "error": "请输入推文链接"}), 400
@@ -96,6 +109,8 @@ def api_capture():
             dark_mode=dark_mode,
             video_timestamp_seconds=video_timestamp_seconds,
             translate_body=translate_body,
+            custom_translation=custom_translation,
+            translation_overrides=translation_overrides,
         ).result()
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
@@ -115,6 +130,54 @@ def api_capture():
             "usedUrl": result.used_url,
             "tweetId": result.tweet_id,
             "videoFrameSeconds": result.video_frame_seconds,
+        }
+    )
+
+
+@app.post("/api/preview-translations")
+def api_preview_translations():
+    payload = request.get_json(silent=True) or {}
+    url = (payload.get("url") or "").strip()
+    show_browser = bool(payload.get("showBrowser"))
+    dark_mode = payload.get("darkMode")
+    dark_mode = True if dark_mode is None else bool(dark_mode)
+
+    if not url:
+        return jsonify({"ok": False, "error": "请输入推文链接"}), 400
+
+    if not _RUN_LOCK.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "已有截图任务在运行，请稍后再试"}), 429
+
+    try:
+        result = _EXECUTOR.submit(
+            preview_tweet_translations,
+            url,
+            PROFILE_DIR,
+            headless=not show_browser,
+            dark_mode=dark_mode,
+        ).result()
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    finally:
+        _RUN_LOCK.release()
+
+    return jsonify(
+        {
+            "ok": True,
+            "items": [
+                {
+                    "index": item.index,
+                    "label": item.label,
+                    "originalText": item.original_text,
+                    "translation": item.suggested_translation,
+                }
+                for item in result.items
+            ],
+            "usedUrl": result.used_url,
+            "captureMode": result.capture_mode,
+            "tweetId": result.tweet_id,
         }
     )
 

@@ -20,8 +20,12 @@ TWEET_URL_RE = re.compile(
     r"(?P<screen_name>[^/?#]+)/status/(?P<tweet_id>\d+)",
     re.IGNORECASE,
 )
-TRANSLATION_API_URL = "https://api.mymemory.translated.net/get"
+GOOGLE_TRANSLATE_API_URL = "https://translate.googleapis.com/translate_a/single"
+MYMEMORY_TRANSLATE_API_URL = "https://api.mymemory.translated.net/get"
 TRANSLATION_ATTR = "data-resource-snapshot-translation"
+DEFAULT_VIEWPORT_WIDTH = 1280
+DEFAULT_VIEWPORT_HEIGHT = 1800
+CAPTURE_VIEWPORT_MARGIN = 32
 
 
 def _translation_capture_css(dark_mode: bool) -> str:
@@ -154,6 +158,22 @@ class CaptureResult:
     video_frame_seconds: float | None
 
 
+@dataclass(frozen=True)
+class TranslationPreviewItem:
+    index: int
+    label: str
+    original_text: str
+    suggested_translation: str
+
+
+@dataclass(frozen=True)
+class TranslationPreviewResult:
+    items: tuple[TranslationPreviewItem, ...]
+    used_url: str
+    capture_mode: str
+    tweet_id: str
+
+
 def _normalize_input_url(url: str) -> str:
     value = (url or "").strip()
     if not value:
@@ -215,6 +235,21 @@ def _dismiss_common_overlays(page) -> None:
     page.evaluate(
         """
         () => {
+          const isVisible = (node) => {
+            if (!(node instanceof HTMLElement)) {
+              return false;
+            }
+            const style = window.getComputedStyle(node);
+            if (!style) {
+              return false;
+            }
+            if (style.display === 'none' || style.visibility === 'hidden') {
+              return false;
+            }
+            const rect = node.getBoundingClientRect();
+            return rect.width > 20 && rect.height > 20;
+          };
+
           const selectors = [
             '[role="dialog"]',
             '[data-testid="sheetDialog"]',
@@ -224,6 +259,35 @@ def _dismiss_common_overlays(page) -> None:
           for (const selector of selectors) {
             document.querySelectorAll(selector).forEach((node) => node.remove());
           }
+
+          const primaryColumn = document.querySelector('[data-testid="primaryColumn"]');
+          if (primaryColumn instanceof HTMLElement) {
+            for (const node of primaryColumn.querySelectorAll('*')) {
+              if (!(node instanceof HTMLElement) || !isVisible(node)) {
+                continue;
+              }
+
+              const style = window.getComputedStyle(node);
+              const rect = node.getBoundingClientRect();
+              const text = (node.innerText || '').trim();
+
+              const isTopStickyBar =
+                (style.position === 'sticky' || style.position === 'fixed') &&
+                rect.top <= 1 &&
+                rect.height <= 80;
+
+              const isTopFeedNotice =
+                text &&
+                ['查看新帖子', 'View new posts', 'See new posts'].includes(text) &&
+                rect.top < 140 &&
+                rect.height <= 80;
+
+              if (isTopStickyBar || isTopFeedNotice) {
+                node.remove();
+              }
+            }
+          }
+
           document.documentElement.style.scrollBehavior = 'auto';
           document.body.style.overflow = 'auto';
         }
@@ -359,6 +423,22 @@ def _normalize_translation_lang(lang: str | None) -> str | None:
     return lowered
 
 
+def _fetch_translation_payload(url: str) -> object | None:
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "resource-snapshot/1.0",
+            "Accept": "application/json",
+        },
+    )
+
+    try:
+        with urlopen(request, timeout=12) as response:
+            return json.load(response)
+    except Exception:
+        return None
+
+
 def _extract_translatable_text_blocks(tweet_card) -> list[dict[str, str | int | None]]:
     try:
         blocks = tweet_card.evaluate(
@@ -398,25 +478,49 @@ def _extract_translatable_text_blocks(tweet_card) -> list[dict[str, str | int | 
     return blocks
 
 
-def _translate_text_to_chinese(text: str, source_lang: str | None) -> str | None:
+def _translate_text_to_chinese_via_google(text: str, source_lang: str | None) -> str | None:
+    normalized_text = (text or "").strip()
+    normalized_lang = _normalize_translation_lang(source_lang) or "auto"
+    if not normalized_text:
+        return None
+
+    query = urlencode(
+        {
+            "client": "gtx",
+            "sl": normalized_lang,
+            "tl": "zh-CN",
+            "dt": "t",
+            "q": normalized_text,
+        }
+    )
+    payload = _fetch_translation_payload(f"{GOOGLE_TRANSLATE_API_URL}?{query}")
+    if not isinstance(payload, list) or not payload or not isinstance(payload[0], list):
+        return None
+
+    translated_parts: list[str] = []
+    for part in payload[0]:
+        if not isinstance(part, list) or not part:
+            continue
+        if isinstance(part[0], str) and part[0]:
+            translated_parts.append(part[0])
+
+    translated = "".join(translated_parts).strip()
+    if not translated:
+        return None
+    if translated.casefold() == normalized_text.casefold():
+        return None
+    return translated
+
+
+def _translate_text_to_chinese_via_mymemory(text: str, source_lang: str | None) -> str | None:
     normalized_text = (text or "").strip()
     normalized_lang = _normalize_translation_lang(source_lang)
-    if not normalized_text or not normalized_lang or normalized_lang.startswith("zh"):
+    if not normalized_text or not normalized_lang:
         return None
 
     query = urlencode({"q": normalized_text, "langpair": f"{normalized_lang}|zh-CN"})
-    request = Request(
-        f"{TRANSLATION_API_URL}?{query}",
-        headers={
-            "User-Agent": "resource-snapshot/1.0",
-            "Accept": "application/json",
-        },
-    )
-
-    try:
-        with urlopen(request, timeout=12) as response:
-            payload = json.load(response)
-    except Exception:
+    payload = _fetch_translation_payload(f"{MYMEMORY_TRANSLATE_API_URL}?{query}")
+    if not isinstance(payload, dict):
         return None
 
     if payload.get("responseStatus") != 200:
@@ -430,34 +534,133 @@ def _translate_text_to_chinese(text: str, source_lang: str | None) -> str | None
     return translated
 
 
-def _inject_chinese_translations(tweet_card) -> int:
-    text_blocks = _extract_translatable_text_blocks(tweet_card)
-    if not text_blocks:
-        return 0
+def _translate_text_to_chinese(text: str, source_lang: str | None) -> str | None:
+    normalized_text = (text or "").strip()
+    normalized_lang = _normalize_translation_lang(source_lang)
+    if not normalized_text or (normalized_lang and normalized_lang.startswith("zh")):
+        return None
+
+    translated = _translate_text_to_chinese_via_google(normalized_text, normalized_lang)
+    if translated:
+        return translated
+    return _translate_text_to_chinese_via_mymemory(normalized_text, normalized_lang)
+
+
+def _split_custom_translation_blocks(custom_translation: str | None) -> tuple[list[str], dict[int, str]]:
+    normalized = (custom_translation or "").strip()
+    if not normalized:
+        return [], {}
+
+    named_overrides: dict[int, str] = {}
+    current_target: int | None = None
+    current_lines: list[str] = []
+    saw_named_override = False
+
+    def flush_named_override() -> None:
+        nonlocal current_target, current_lines
+        if current_target is None:
+            current_lines = []
+            return
+        content = "\n".join(current_lines).strip()
+        if content:
+            named_overrides[current_target] = content
+        current_target = None
+        current_lines = []
+
+    label_map = {
+        "主帖": 0,
+        "正文": 0,
+        "原帖": 0,
+        "引用": 1,
+        "引用贴": 1,
+    }
+
+    for line in normalized.splitlines():
+        match = re.match(r"^\s*(主帖|正文|原帖|引用|引用贴)\s*[:：]\s*(.*)$", line)
+        if match:
+            saw_named_override = True
+            flush_named_override()
+            current_target = label_map[match.group(1)]
+            remainder = match.group(2).strip()
+            current_lines = [remainder] if remainder else []
+            continue
+
+        if current_target is not None:
+            current_lines.append(line)
+
+    flush_named_override()
+    if saw_named_override:
+        return [], named_overrides
+
+    parts = [
+        part.strip()
+        for part in re.split(r"(?:\r?\n\s*){2,}", normalized)
+        if part.strip()
+    ]
+    return parts, {}
+
+
+def _build_translation_items(
+    text_blocks: list[dict[str, str | int | None]],
+    *,
+    translation_overrides: dict[int, str] | None = None,
+    custom_translation: str | None = None,
+) -> list[dict[str, str | int]]:
+    custom_translation_blocks, custom_translation_overrides = _split_custom_translation_blocks(custom_translation)
+    overrides = {int(index): str(value) for index, value in (translation_overrides or {}).items()}
+    overrides.update(custom_translation_overrides)
 
     cache: dict[tuple[str, str], str | None] = {}
     items: list[dict[str, str | int]] = []
-    for block in text_blocks:
+    for index, block in enumerate(text_blocks):
         text = str(block.get("text") or "").strip()
         lang = _normalize_translation_lang(block.get("lang"))
-        if not text or not lang or lang.startswith("zh"):
+        if not text:
             continue
 
-        cache_key = (text, lang)
-        if cache_key not in cache:
-            cache[cache_key] = _translate_text_to_chinese(text, lang)
+        translation: str | None
+        if index in overrides:
+            translation = str(overrides[index]).strip()
+        elif index < len(custom_translation_blocks):
+            translation = custom_translation_blocks[index]
+        else:
+            if lang and lang.startswith("zh"):
+                continue
+            cache_key = (text, lang or "auto")
+            if cache_key not in cache:
+                cache[cache_key] = _translate_text_to_chinese(text, lang)
+            translation = cache[cache_key]
 
-        translation = cache[cache_key]
         if not translation:
+            continue
+        if translation.casefold() == text.casefold():
             continue
 
         items.append(
             {
                 "index": int(block["index"]),
+                "text": text,
                 "translation": translation,
             }
         )
 
+    return items
+
+
+def _inject_chinese_translations(
+    tweet_card,
+    custom_translation: str | None = None,
+    translation_overrides: dict[int, str] | None = None,
+) -> int:
+    text_blocks = _extract_translatable_text_blocks(tweet_card)
+    if not text_blocks:
+        return 0
+
+    items = _build_translation_items(
+        text_blocks,
+        translation_overrides=translation_overrides,
+        custom_translation=custom_translation,
+    )
     if not items:
         return 0
 
@@ -565,6 +768,14 @@ def _remove_native_translation_ui(tweet_card) -> None:
         )
     except Exception:
         return
+
+
+def _translation_label_for_index(index: int) -> str:
+    if index == 0:
+        return "主帖正文"
+    if index == 1:
+        return "引用贴正文"
+    return f"第 {index + 1} 段正文"
 
 
 def _prepare_video_frame(tweet_card, target_seconds: float | None) -> float | None:
@@ -967,13 +1178,21 @@ def _compute_capture_clip(page, tweet_card):
 
           const actionBar = actionGroups.sort((a, b) => b.bottom - a.bottom)[0];
 
+          const rootX = rootRect.left + window.scrollX;
+          const rootY = rootRect.top + window.scrollY;
+          const rootRight = rootX + rootRect.width;
+          const rootBottom = rootY + rootRect.height;
+
           if (!Number.isFinite(left)) {
-            const rootX = rootRect.left + window.scrollX;
-            const rootY = rootRect.top + window.scrollY;
             left = rootX;
             top = rootY;
-            right = rootX + rootRect.width;
-            bottom = rootY + rootRect.height;
+            right = rootRight;
+            bottom = rootBottom;
+          } else {
+            // Keep the full tweet-card header visible, including avatar and author line.
+            left = Math.min(left, rootX);
+            top = Math.min(top, rootY);
+            right = Math.max(right, rootRight);
           }
 
           const padding = 12;
@@ -992,8 +1211,36 @@ def _compute_capture_clip(page, tweet_card):
     )
 
 
+def _ensure_viewport_can_fit_clip(page, clip: dict[str, int] | None) -> bool:
+    if not clip:
+        return False
+
+    viewport = page.viewport_size or {
+        "width": DEFAULT_VIEWPORT_WIDTH,
+        "height": DEFAULT_VIEWPORT_HEIGHT,
+    }
+    required_width = max(int(clip["width"]) + CAPTURE_VIEWPORT_MARGIN, DEFAULT_VIEWPORT_WIDTH)
+    required_height = max(int(clip["height"]) + CAPTURE_VIEWPORT_MARGIN, DEFAULT_VIEWPORT_HEIGHT)
+
+    if required_width <= viewport["width"] and required_height <= viewport["height"]:
+        return False
+
+    page.set_viewport_size(
+        {
+            "width": required_width,
+            "height": required_height,
+        }
+    )
+    page.wait_for_timeout(300)
+    return True
+
+
 def _capture_detail_snapshot(page, tweet_card, path: Path) -> None:
     clip = _compute_capture_clip(page, tweet_card)
+    if _ensure_viewport_can_fit_clip(page, clip):
+        _wait_for_tweet_assets(page, tweet_card)
+        clip = _compute_capture_clip(page, tweet_card)
+
     if clip:
         page.screenshot(
             path=str(path),
@@ -1024,6 +1271,122 @@ def _build_output_name(detail_url: str, output_dir: Path) -> str:
     return candidate
 
 
+def _create_capture_context(playwright, browser_profile: Path, *, headless: bool, dark_mode: bool, wait_timeout_ms: int):
+    context = playwright.chromium.launch_persistent_context(
+        str(browser_profile),
+        headless=headless,
+        viewport={"width": DEFAULT_VIEWPORT_WIDTH, "height": DEFAULT_VIEWPORT_HEIGHT},
+        device_scale_factor=2,
+        locale="zh-CN",
+        color_scheme="dark" if dark_mode else "light",
+        ignore_https_errors=True,
+        args=["--disable-blink-features=AutomationControlled"],
+    )
+    page = context.pages[0] if context.pages else context.new_page()
+    page.set_default_timeout(wait_timeout_ms)
+    page.set_default_navigation_timeout(wait_timeout_ms)
+    page.emulate_media(color_scheme="dark" if dark_mode else "light")
+    return context, page
+
+
+def _load_tweet_card(page, normalized_url: str, screen_name: str, tweet_id: str, *, dark_mode: bool, wait_timeout_ms: int):
+    last_error: Exception | None = None
+
+    for candidate_url, mode in _candidate_urls(normalized_url, screen_name, tweet_id):
+        try:
+            active_url = candidate_url
+            if mode == "embed_card" and dark_mode:
+                active_url = f"{candidate_url}&theme=dark"
+
+            page.goto(active_url, wait_until="domcontentloaded")
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)
+            except PlaywrightTimeoutError:
+                pass
+
+            _dismiss_common_overlays(page)
+
+            tweet_card = _wait_for_tweet_card(
+                page,
+                tweet_id,
+                mode,
+                wait_timeout_ms if mode == "detail_page" else 12000,
+            )
+            if tweet_card is None:
+                raise RuntimeError("页面里没有找到可截图的推文主体")
+
+            page.add_style_tag(
+                content=_detail_capture_css(dark_mode) if mode == "detail_page" else _embed_capture_css(dark_mode)
+            )
+            _dismiss_common_overlays(page)
+            return tweet_card, active_url, mode
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    detail = (
+        "可能是链接无效、推文已删除，或该推文需要先登录 X 才能查看。"
+        " 如果需要登录，请勾选页面里的“显示浏览器”后重新截图。"
+    )
+    if last_error:
+        raise RuntimeError(detail) from last_error
+    raise RuntimeError(detail)
+
+
+def preview_tweet_translations(
+    url: str,
+    profile_dir: Path | str,
+    *,
+    headless: bool = True,
+    dark_mode: bool = True,
+) -> TranslationPreviewResult:
+    normalized_url = _normalize_input_url(url)
+    screen_name, tweet_id = _extract_parts(normalized_url)
+
+    browser_profile = Path(profile_dir)
+    browser_profile.mkdir(parents=True, exist_ok=True)
+    wait_timeout_ms = 90000 if not headless else 25000
+
+    with sync_playwright() as playwright:
+        context, page = _create_capture_context(
+            playwright,
+            browser_profile,
+            headless=headless,
+            dark_mode=dark_mode,
+            wait_timeout_ms=wait_timeout_ms,
+        )
+        try:
+            tweet_card, used_url, capture_mode = _load_tweet_card(
+                page,
+                normalized_url,
+                screen_name,
+                tweet_id,
+                dark_mode=dark_mode,
+                wait_timeout_ms=wait_timeout_ms,
+            )
+            _wait_for_tweet_assets(page, tweet_card)
+
+            text_blocks = _extract_translatable_text_blocks(tweet_card)
+            items = tuple(
+                TranslationPreviewItem(
+                    index=int(item["index"]),
+                    label=_translation_label_for_index(int(item["index"])),
+                    original_text=str(item["text"]),
+                    suggested_translation=str(item["translation"]),
+                )
+                for item in _build_translation_items(text_blocks)
+            )
+        finally:
+            context.close()
+
+    return TranslationPreviewResult(
+        items=items,
+        used_url=used_url,
+        capture_mode=capture_mode,
+        tweet_id=tweet_id,
+    )
+
+
 def capture_tweet_page(
     url: str,
     output_dir: Path | str,
@@ -1032,7 +1395,9 @@ def capture_tweet_page(
     headless: bool = True,
     dark_mode: bool = True,
     video_timestamp_seconds: float | None = None,
-    translate_body: bool = True,
+    translate_body: bool = False,
+    custom_translation: str | None = None,
+    translation_overrides: dict[int, str] | None = None,
 ) -> CaptureResult:
     normalized_url = _normalize_input_url(url)
     screen_name, tweet_id = _extract_parts(normalized_url)
@@ -1051,82 +1416,42 @@ def capture_tweet_page(
     wait_timeout_ms = 90000 if not headless else 25000
 
     with sync_playwright() as playwright:
-        context = playwright.chromium.launch_persistent_context(
-            str(browser_profile),
+        context, page = _create_capture_context(
+            playwright,
+            browser_profile,
             headless=headless,
-            viewport={"width": 1280, "height": 1800},
-            device_scale_factor=2,
-            locale="zh-CN",
-            color_scheme="dark" if dark_mode else "light",
-            ignore_https_errors=True,
-            args=["--disable-blink-features=AutomationControlled"],
+            dark_mode=dark_mode,
+            wait_timeout_ms=wait_timeout_ms,
         )
 
         try:
-            page = context.pages[0] if context.pages else context.new_page()
-            page.set_default_timeout(wait_timeout_ms)
-            page.set_default_navigation_timeout(wait_timeout_ms)
-            page.emulate_media(color_scheme="dark" if dark_mode else "light")
-
-            last_error: Exception | None = None
-
-            for candidate_url, mode in _candidate_urls(normalized_url, screen_name, tweet_id):
-                try:
-                    active_url = candidate_url
-                    if mode == "embed_card" and dark_mode:
-                        active_url = f"{candidate_url}&theme=dark"
-
-                    page.goto(active_url, wait_until="domcontentloaded")
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=5000)
-                    except PlaywrightTimeoutError:
-                        pass
-
-                    _dismiss_common_overlays(page)
-
-                    tweet_card = _wait_for_tweet_card(
-                        page,
-                        tweet_id,
-                        mode,
-                        wait_timeout_ms if mode == "detail_page" else 12000,
-                    )
-                    if tweet_card is None:
-                        raise RuntimeError("页面里没有找到可截图的推文主体")
-
-                    page.add_style_tag(
-                        content=_detail_capture_css(dark_mode) if mode == "detail_page" else _embed_capture_css(dark_mode)
-                    )
-                    _dismiss_common_overlays(page)
-                    _wait_for_tweet_assets(page, tweet_card)
-                    if translate_body:
-                        _inject_chinese_translations(tweet_card)
-                        _remove_native_translation_ui(tweet_card)
-                    _scroll_tweet_into_view(page, tweet_card)
-                    page.wait_for_timeout(250)
-                    video_frame_seconds = _prepare_video_frame(tweet_card, video_timestamp_seconds)
-
-                    used_url = active_url
-                    capture_mode = mode
-
-                    if mode == "detail_page":
-                        _capture_detail_snapshot(page, tweet_card, saved_to)
-                    else:
-                        tweet_card.screenshot(
-                            path=str(saved_to),
-                            animations="disabled",
-                        )
-                    break
-                except Exception as exc:
-                    last_error = exc
-                    continue
-            else:
-                detail = (
-                    "可能是链接无效、推文已删除，或该推文需要先登录 X 才能查看。"
-                    " 如果需要登录，请勾选页面里的“显示浏览器”后重新截图。"
+            tweet_card, used_url, capture_mode = _load_tweet_card(
+                page,
+                normalized_url,
+                screen_name,
+                tweet_id,
+                dark_mode=dark_mode,
+                wait_timeout_ms=wait_timeout_ms,
+            )
+            _wait_for_tweet_assets(page, tweet_card)
+            if translate_body:
+                _inject_chinese_translations(
+                    tweet_card,
+                    custom_translation=custom_translation,
+                    translation_overrides=translation_overrides,
                 )
-                if last_error:
-                    raise RuntimeError(detail) from last_error
-                raise RuntimeError(detail)
+                _remove_native_translation_ui(tweet_card)
+            _scroll_tweet_into_view(page, tweet_card)
+            page.wait_for_timeout(250)
+            video_frame_seconds = _prepare_video_frame(tweet_card, video_timestamp_seconds)
+
+            if capture_mode == "detail_page":
+                _capture_detail_snapshot(page, tweet_card, saved_to)
+            else:
+                tweet_card.screenshot(
+                    path=str(saved_to),
+                    animations="disabled",
+                )
         finally:
             context.close()
 
