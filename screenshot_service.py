@@ -148,6 +148,14 @@ html, body {{
 
 
 @dataclass(frozen=True)
+class VideoFrameInfo:
+    index: int
+    label: str
+    seconds: float
+    quoted: bool
+
+
+@dataclass(frozen=True)
 class CaptureResult:
     file_name: str
     file_path: Path
@@ -156,6 +164,7 @@ class CaptureResult:
     used_url: str
     tweet_id: str
     video_frame_seconds: float | None
+    video_frames: tuple[VideoFrameInfo, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -778,11 +787,119 @@ def _translation_label_for_index(index: int) -> str:
     return f"第 {index + 1} 段正文"
 
 
-def _prepare_video_frame(tweet_card, target_seconds: float | None) -> float | None:
+def _parse_video_timestamp(value: object | None) -> float | None:
+    raw = "" if value is None else str(value).strip()
+    if not raw:
+        return None
+
+    parts = raw.split(":")
+    if len(parts) > 3 or any(part.strip() == "" for part in parts):
+        raise ValueError("视频时间点格式不太对，可以填 2、10.5 或 01:23")
+
+    total_seconds = 0.0
+    multiplier = 1.0
+    try:
+        for part in reversed(parts):
+            amount = float(part)
+            if amount < 0:
+                raise ValueError
+            total_seconds += amount * multiplier
+            multiplier *= 60.0
+    except ValueError as exc:
+        raise ValueError("视频时间点格式不太对，可以填 2、10.5 或 01:23") from exc
+
+    return total_seconds
+
+
+def _split_video_timestamp_input(raw: str | None) -> tuple[list[str], dict[int, str]]:
+    normalized = (raw or "").strip()
+    if not normalized:
+        return [], {}
+
+    named: dict[int, str] = {}
+    sequential: list[str] = []
+    saw_named = False
+    label_map = {
+        "主帖": 0,
+        "正文": 0,
+        "原帖": 0,
+        "引用": 1,
+        "引用贴": 1,
+    }
+
+    for line in normalized.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = re.match(r"^\s*(主帖|正文|原帖|引用|引用贴)\s*[:：]\s*(.*)$", stripped)
+        if match:
+            saw_named = True
+            time_part = match.group(2).strip()
+            if time_part:
+                named[label_map[match.group(1)]] = time_part
+            continue
+        if not saw_named:
+            sequential.append(stripped)
+
+    if saw_named:
+        return [], named
+    return sequential, {}
+
+
+def parse_video_timestamps_from_request(
+    video_time: object | None = None,
+    video_times: object | None = None,
+) -> dict[str, dict[str, float | None]]:
+    chunks: list[str] = []
+    if video_times is not None:
+        if isinstance(video_times, list):
+            chunks.extend(str(item) for item in video_times if str(item).strip())
+        else:
+            text = str(video_times).strip()
+            if text:
+                chunks.append(text)
+    if video_time is not None and str(video_time).strip():
+        legacy = str(video_time).strip()
+        if not chunks:
+            chunks.append(legacy)
+
+    sequential, named = _split_video_timestamp_input("\n".join(chunks))
+    by_index: dict[str, float | None] = {}
+    for index, part in enumerate(sequential):
+        parsed = _parse_video_timestamp(part)
+        if parsed is not None:
+            by_index[str(index)] = parsed
+
+    named_out: dict[str, float | None] = {}
+    if 0 in named:
+        named_out["main"] = _parse_video_timestamp(named[0])
+    if 1 in named:
+        named_out["quote"] = _parse_video_timestamp(named[1])
+
+    return {"byIndex": by_index, "named": named_out}
+
+
+def _video_frame_label(*, quoted: bool, main_ordinal: int, quote_ordinal: int) -> str:
+    if not quoted:
+        if main_ordinal == 0:
+            return "主帖视频"
+        return f"主帖视频 {main_ordinal + 1}"
+    if quote_ordinal == 0:
+        return "引用贴视频"
+    return f"引用贴视频 {quote_ordinal + 1}"
+
+
+def _prepare_video_frames(
+    tweet_card,
+    schedule: dict[str, dict[str, float | None]] | None,
+) -> tuple[VideoFrameInfo, ...]:
+    payload = schedule or {"byIndex": {}, "named": {}}
     try:
         result = tweet_card.evaluate(
             """
-            async (root, targetSeconds) => {
+            async (root, schedule) => {
+              const byIndex = schedule?.byIndex || {};
+              const named = schedule?.named || {};
               const isVisible = (node) => {
                 if (!(node instanceof Element)) {
                   return false;
@@ -831,19 +948,71 @@ def _prepare_video_frame(tweet_card, target_seconds: float | None) -> float | No
                   target.addEventListener(eventName, onEvent, { once: true });
                 });
 
+              const isInQuotedTweet = (node) =>
+                Boolean(
+                  node.closest('[data-testid="card.wrapper"]') ||
+                    node.closest('[data-testid="quoteTweet"]'),
+                );
+
               const videos = [...root.querySelectorAll('video')]
                 .filter((video) => isVisible(video))
                 .map((video) => {
                   const rect = video.getBoundingClientRect();
-                  return { video, area: rect.width * rect.height };
-                })
-                .sort((a, b) => b.area - a.area);
+                  return {
+                    video,
+                    area: rect.width * rect.height,
+                    quoted: isInQuotedTweet(video),
+                  };
+                });
 
               if (videos.length === 0) {
-                return null;
+                return [];
               }
 
-              const video = videos[0].video;
+              const sortByPosition = (a, b) => {
+                const rectA = a.video.getBoundingClientRect();
+                const rectB = b.video.getBoundingClientRect();
+                if (Math.abs(rectA.top - rectB.top) > 8) {
+                  return rectA.top - rectB.top;
+                }
+                return rectA.left - rectB.left;
+              };
+
+              const mainVideos = videos.filter((entry) => !entry.quoted).sort(sortByPosition);
+              const quotedVideos = videos.filter((entry) => entry.quoted).sort(sortByPosition);
+              const ordered = [...mainVideos, ...quotedVideos];
+              const firstMainIdx = ordered.findIndex((entry) => !entry.quoted);
+              const firstQuoteIdx = ordered.findIndex((entry) => entry.quoted);
+
+              const resolveTargetSeconds = (index, quoted) => {
+                const key = String(index);
+                if (
+                  Object.prototype.hasOwnProperty.call(byIndex, key) &&
+                  byIndex[key] !== null &&
+                  byIndex[key] !== undefined
+                ) {
+                  return byIndex[key];
+                }
+                if (
+                  !quoted &&
+                  index === firstMainIdx &&
+                  named.main !== null &&
+                  named.main !== undefined
+                ) {
+                  return named.main;
+                }
+                if (
+                  quoted &&
+                  index === firstQuoteIdx &&
+                  named.quote !== null &&
+                  named.quote !== undefined
+                ) {
+                  return named.quote;
+                }
+                return null;
+              };
+
+              const prepareOneVideo = async (video, targetSeconds, cardRoot) => {
               video.muted = true;
               video.defaultMuted = true;
               video.playsInline = true;
@@ -854,7 +1023,7 @@ def _prepare_video_frame(tweet_card, target_seconds: float | None) -> float | No
                 video.closest('[data-testid="videoComponent"]') ||
                 video.closest('[data-testid="videoPlayer"]') ||
                 video.parentElement ||
-                root;
+                cardRoot;
 
               const activatePlayer = () => {
                 const candidates = [
@@ -1054,16 +1223,81 @@ def _prepare_video_frame(tweet_card, target_seconds: float | None) -> float | No
               hideVideoOverlays();
               await wait(160);
               return Number.isFinite(video.currentTime) ? video.currentTime : desiredTime;
+              };
+
+              const frameResults = [];
+              for (let index = 0; index < ordered.length; index += 1) {
+                const entry = ordered[index];
+                const seconds = await prepareOneVideo(
+                  entry.video,
+                  resolveTargetSeconds(index, entry.quoted),
+                  root,
+                );
+                frameResults.push({
+                  index,
+                  quoted: entry.quoted,
+                  seconds,
+                });
+              }
+
+              for (const entry of ordered) {
+                try {
+                  entry.video.pause();
+                } catch (error) {
+                }
+              }
+
+              return frameResults;
             }
             """,
-            target_seconds,
+            payload,
         )
     except Exception:
-        return None
+        return ()
 
-    if isinstance(result, (int, float)):
-        return max(0.0, float(result))
-    return None
+    if not isinstance(result, list):
+        return ()
+
+    frames: list[VideoFrameInfo] = []
+    main_ordinal = 0
+    quote_ordinal = 0
+    for item in result:
+        if not isinstance(item, dict):
+            continue
+        try:
+            slot_index = int(item.get("index", 0))
+            quoted = bool(item.get("quoted"))
+            seconds = float(item.get("seconds", 0))
+        except (TypeError, ValueError):
+            continue
+        if seconds < 0:
+            continue
+
+        if quoted:
+            label = _video_frame_label(
+                quoted=True,
+                main_ordinal=0,
+                quote_ordinal=quote_ordinal,
+            )
+            quote_ordinal += 1
+        else:
+            label = _video_frame_label(
+                quoted=False,
+                main_ordinal=main_ordinal,
+                quote_ordinal=0,
+            )
+            main_ordinal += 1
+
+        frames.append(
+            VideoFrameInfo(
+                index=slot_index,
+                label=label,
+                seconds=max(0.0, seconds),
+                quoted=quoted,
+            )
+        )
+
+    return tuple(frames)
 
 
 def _compute_capture_clip(page, tweet_card):
@@ -1395,6 +1629,7 @@ def capture_tweet_page(
     headless: bool = True,
     dark_mode: bool = True,
     video_timestamp_seconds: float | None = None,
+    video_frame_schedule: dict[str, dict[str, float | None]] | None = None,
     translate_body: bool = False,
     custom_translation: str | None = None,
     translation_overrides: dict[int, str] | None = None,
@@ -1413,6 +1648,12 @@ def capture_tweet_page(
     used_url = ""
     capture_mode = ""
     video_frame_seconds = None
+    video_frames: tuple[VideoFrameInfo, ...] = ()
+    schedule = video_frame_schedule
+    if schedule is None:
+        schedule = {"byIndex": {}, "named": {}}
+        if video_timestamp_seconds is not None:
+            schedule["byIndex"]["0"] = video_timestamp_seconds
     wait_timeout_ms = 90000 if not headless else 25000
 
     with sync_playwright() as playwright:
@@ -1443,7 +1684,9 @@ def capture_tweet_page(
                 _remove_native_translation_ui(tweet_card)
             _scroll_tweet_into_view(page, tweet_card)
             page.wait_for_timeout(250)
-            video_frame_seconds = _prepare_video_frame(tweet_card, video_timestamp_seconds)
+            video_frames = _prepare_video_frames(tweet_card, schedule)
+            if video_frames:
+                video_frame_seconds = video_frames[0].seconds
 
             if capture_mode == "detail_page":
                 _capture_detail_snapshot(page, tweet_card, saved_to)
@@ -1463,4 +1706,5 @@ def capture_tweet_page(
         used_url=used_url,
         tweet_id=tweet_id,
         video_frame_seconds=video_frame_seconds,
+        video_frames=video_frames,
     )

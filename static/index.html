@@ -399,6 +399,23 @@
       font-size: 13px;
     }
 
+    .video-frame-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      margin: 0 10px 8px 0;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: rgba(116, 200, 255, 0.1);
+      border: 1px solid rgba(116, 200, 255, 0.22);
+    }
+
+    .video-frame-chip strong {
+      color: var(--text);
+      font-weight: 600;
+      font-size: 13px;
+    }
+
     .meta a {
       color: var(--accent-2);
     }
@@ -452,9 +469,9 @@
           <p class="action-note">直接点“开始截图”会生成原图。先点“获取翻译”，确认内容后再点“开始截图”，则会把翻译一并带进最终图片。</p>
 
           <div class="subfield">
-            <label class="label" for="videoTime">视频时间点（可选）</label>
-            <input id="videoTime" type="text" placeholder="例如 2、10.5 或 01:23" autocomplete="off">
-            <p class="hint">如果推文里有视频，可以直接填想截取的时间点。比如填 `2` 表示第 2 秒，填 `10.5` 表示第 10.5 秒，也可以用 `01:23` 这样的分:秒格式。留空也没关系，工具会自动帮你尽量避开开头的封面帧或黑帧。</p>
+            <label class="label" for="videoTimes">视频时间点（可选）</label>
+            <textarea id="videoTimes" rows="3" placeholder="例如：&#10;主帖: 2&#10;引用: 01:23&#10;或每行一个时间点：2 / 10.5" autocomplete="off"></textarea>
+            <p class="hint">按页面里视频出现顺序设置：主帖视频在前，引用贴视频在后。可写 `主帖: 2`、`引用: 01:23`，也可以每行一个时间点（第一行对应第一个视频）。留空的视频会自动避开封面帧或黑帧。这个设置不会影响已经确认的翻译。</p>
           </div>
 
           <label class="toggle">
@@ -490,7 +507,7 @@
             <div>文件名：<code id="fileName"></code></div>
             <div>保存路径：<code id="savedTo"></code></div>
             <div>截图模式：<code id="captureMode"></code></div>
-            <div id="videoFrameRow" hidden>视频画面：<code id="videoFrame"></code></div>
+            <div id="videoFrameRow" hidden>视频画面：<span id="videoFrame"></span></div>
             <div>实际访问：<a id="usedUrl" href="#" target="_blank" rel="noreferrer">打开链接</a></div>
             <div><a id="openImage" href="#" target="_blank" rel="noreferrer">在新标签页打开图片</a></div>
           </div>
@@ -506,7 +523,7 @@
           <li>默认优先截取推文详情页；如果详情页无法加载，会自动回退到嵌入卡片截图。</li>
           <li>直接点击“开始截图”会生成原图；先点“获取翻译”再截图，会把确认后的中文一并放进图片。</li>
           <li>翻译确认区里可以逐段修改中文，也可以一键复制原文去第三方翻译；作者名、时间等信息不会被翻译。</li>
-          <li>如果推文里有视频，可以直接填时间点，比如 `2`、`10.5`，或者 `01:23`。</li>
+          <li>如果推文里有多个视频，可以按行填写多个时间点，或用 `主帖:`、`引用:` 指定。</li>
           <li>截图文件会带上推文 ID 和时间戳，方便反复保存不覆盖。</li>
         </ul>
       </div>
@@ -521,7 +538,7 @@
     const translateBtn = document.getElementById('translateBtn');
     const captureBtn = document.getElementById('captureBtn');
     const input = document.getElementById('url');
-    const videoTime = document.getElementById('videoTime');
+    const videoTimes = document.getElementById('videoTimes');
     const showBrowser = document.getElementById('showBrowser');
     const darkMode = document.getElementById('darkMode');
     const translationReview = document.getElementById('translationReview');
@@ -571,7 +588,7 @@
     function getBasePayload() {
       return {
         url: input.value.trim(),
-        videoTime: videoTime.value.trim(),
+        videoTimes: videoTimes.value.trim(),
         showBrowser: showBrowser.checked,
         darkMode: darkMode.checked
       };
@@ -712,8 +729,18 @@
       fileName.textContent = data.fileName;
       savedTo.textContent = data.savedTo;
       captureMode.textContent = data.captureMode === 'detail_page' ? '详情页截图' : '嵌入卡片截图';
-      if (typeof data.videoFrameSeconds === 'number') {
-        videoFrame.textContent = formatVideoTime(data.videoFrameSeconds);
+      const frames = Array.isArray(data.videoFrames) ? data.videoFrames : [];
+      if (frames.length > 0) {
+        videoFrame.innerHTML = frames
+          .map((frame) => {
+            const label = frame.label || `视频 ${Number(frame.index) + 1}`;
+            const time = formatVideoTime(frame.seconds);
+            return `<span class="video-frame-chip"><strong>${label}</strong> <code>${time}</code></span>`;
+          })
+          .join('');
+        videoFrameRow.hidden = false;
+      } else if (typeof data.videoFrameSeconds === 'number') {
+        videoFrame.innerHTML = `<code>${formatVideoTime(data.videoFrameSeconds)}</code>`;
         videoFrameRow.hidden = false;
       } else {
         videoFrame.textContent = '';
@@ -827,7 +854,7 @@
       }
     });
 
-    [input, videoTime, showBrowser, darkMode].forEach((element) => {
+    [input, videoTimes, showBrowser, darkMode].forEach((element) => {
       element.addEventListener('input', resetTranslationReview);
       element.addEventListener('change', resetTranslationReview);
     });
