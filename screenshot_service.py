@@ -8,6 +8,8 @@ from html import unescape
 import json
 from pathlib import Path
 import re
+import time
+from typing import Callable
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
@@ -26,6 +28,17 @@ TRANSLATION_ATTR = "data-resource-snapshot-translation"
 DEFAULT_VIEWPORT_WIDTH = 1280
 DEFAULT_VIEWPORT_HEIGHT = 1800
 CAPTURE_VIEWPORT_MARGIN = 32
+CAPTURE_DEVICE_SCALE_FACTOR = 2
+GUEST_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+GUEST_VIEWPORT_WIDTH = 1280
+GUEST_VIEWPORT_HEIGHT = 2000
+GUEST_PAGE_SETTLE_MS = 8000
+GUEST_POST_SCROLL_MS = 3000
+DEFAULT_LOCALE = "zh-CN"
+DEFAULT_TIMEZONE = "Asia/Shanghai"
 
 
 def _translation_capture_css(dark_mode: bool) -> str:
@@ -88,9 +101,73 @@ body {{
 header[role="banner"],
 [data-testid="logged_out_read_replies_pivot"],
 [data-testid="inline_reply_offscreen"],
-[data-testid="tweetTextarea_0"],
-[data-testid="inline_reply_composer"] {{
+[data-testid="tweet-text-show-more-link"],
+[data-testid="reply"] {{
   display: none !important;
+}}
+
+[data-testid="tweetText"],
+article div[dir="auto"] {{
+  overflow: visible !important;
+  max-height: none !important;
+  -webkit-line-clamp: unset !important;
+  line-clamp: unset !important;
+  word-break: keep-all !important;
+  overflow-wrap: anywhere !important;
+  white-space: pre-wrap !important;
+}}
+
+article [data-testid="videoComponent"],
+article [data-testid="videoPlayer"] {{
+  width: fit-content !important;
+  max-width: 100% !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+  background: transparent !important;
+}}
+
+article video {{
+  display: block !important;
+  max-width: 100% !important;
+  background: transparent !important;
+}}
+
+article video::-webkit-media-controls,
+article video::-webkit-media-controls-enclosure,
+article video::-webkit-media-controls-panel {{
+  display: none !important;
+}}
+
+article [data-testid="videoComponent"] [role="progressbar"],
+article [data-testid="videoComponent"] [role="slider"],
+article [data-testid="videoComponent"] input[type="range"],
+article [data-testid="videoPlayer"] [role="progressbar"],
+article [data-testid="videoPlayer"] [role="slider"],
+article [data-testid="videoPlayer"] input[type="range"] {{
+  display: none !important;
+}}
+
+[data-resource-snapshot-media-grid] {{
+  width: 100% !important;
+  border-radius: 16px !important;
+  overflow: hidden !important;
+  background: {border} !important;
+}}
+
+[data-resource-snapshot-media-grid] img {{
+  width: 100% !important;
+  height: 100% !important;
+  object-fit: cover !important;
+  display: block !important;
+}}
+
+main article,
+article[data-testid="tweet"],
+article[data-tweet-id] {{
+  width: 100% !important;
+  max-width: min(598px, calc(100vw - 32px)) !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
 }}
 
 main[role="main"] {{
@@ -106,6 +183,7 @@ main[role="main"] {{
 }}
 
 article[data-testid="tweet"],
+article[data-tweet-id],
 [data-testid="cellInnerDiv"],
 [data-testid="tweet"],
 [data-testid="tweetText"],
@@ -130,18 +208,6 @@ article[data-testid="tweet"] time *,
 [data-testid="User-Name"] span:last-child,
 [data-testid="app-text-transition-container"] {{
   color: {muted} !important;
-}}
-{_translation_capture_css(dark_mode)}
-"""
-
-
-def _embed_capture_css(dark_mode: bool) -> str:
-    background = "#15202b" if dark_mode else "#ffffff"
-    return f"""
-html, body {{
-  margin: 0 !important;
-  background: {background} !important;
-  color-scheme: {"dark" if dark_mode else "light"} !important;
 }}
 {_translation_capture_css(dark_mode)}
 """
@@ -221,7 +287,6 @@ def _candidate_urls(original_url: str, screen_name: str, tweet_id: str) -> list[
         (f"https://{original_host}{detail_path}", "detail_page"),
         (f"https://x.com/i/status/{tweet_id}", "detail_page"),
         (f"https://twitter.com/i/status/{tweet_id}", "detail_page"),
-        (f"https://platform.twitter.com/embed/Tweet.html?id={tweet_id}", "embed_card"),
     ]
 
     unique: list[tuple[str, str]] = []
@@ -304,55 +369,167 @@ def _dismiss_common_overlays(page) -> None:
     )
 
 
-def _wait_for_tweet_card(page, tweet_id: str, mode: str, timeout_ms: int):
-    locators = []
+def _expand_tweet_text(tweet_card) -> None:
+    try:
+        tweet_card.evaluate(
+            """
+            (root) => {
+              const clickables = [
+                ...root.querySelectorAll('[data-testid="tweet-text-show-more-link"]'),
+                ...root.querySelectorAll('a, button, [role="button"], span'),
+              ];
+              for (const node of clickables) {
+                const text = (node.textContent || '').trim();
+                if (!text || text.length > 24) {
+                  continue;
+                }
+                if (/show more|显示更多|展开全文|顯示更多|もっと見る|さらに表示/i.test(text)) {
+                  node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                }
+              }
 
-    if mode == "detail_page":
-        permalink = page.locator(
-            ",".join(
-                [
-                    f"a[href*='/status/{tweet_id}']",
-                    f"a[href*='/i/web/status/{tweet_id}']",
-                    f"a[href$='/{tweet_id}']",
-                ]
+              for (const node of root.querySelectorAll('[data-testid="tweetText"], div[dir="auto"]')) {
+                if (!(node instanceof HTMLElement)) {
+                  continue;
+                }
+                node.style.setProperty('overflow', 'visible', 'important');
+                node.style.setProperty('max-height', 'none', 'important');
+                node.style.setProperty('-webkit-line-clamp', 'unset', 'important');
+                node.style.setProperty('line-clamp', 'unset', 'important');
+                node.style.setProperty('display', 'block', 'important');
+              }
+            }
+            """
+        )
+    except Exception:
+        pass
+
+
+def _hide_non_primary_columns(page) -> None:
+    try:
+        page.evaluate(
+            """
+            () => {
+              const removeNode = (node) => {
+                if (node instanceof Element) {
+                  node.remove();
+                }
+              };
+
+              const selectors = [
+                '[data-testid="sidebarColumn"]',
+                '[data-testid="secondaryColumn"]',
+                '[data-testid="BottomBar"]',
+                '[data-testid="DMDrawer"]',
+                'header[role="banner"]',
+              ];
+              for (const selector of selectors) {
+                document.querySelectorAll(selector).forEach(removeNode);
+              }
+
+              const primary = document.querySelector('[data-testid="primaryColumn"]');
+              if (primary?.parentElement) {
+                for (const child of [...primary.parentElement.children]) {
+                  if (child !== primary) {
+                    removeNode(child);
+                  }
+                }
+              }
+
+              const main = document.querySelector('main[role="main"]');
+              if (main) {
+                const children = [...main.children].filter((node) => node instanceof HTMLElement);
+                if (children.length > 1) {
+                  const primaryChild =
+                    children.find((node) => node.querySelector('article[data-tweet-id], article[data-testid="tweet"]')) ||
+                    children[0];
+                  for (const child of children) {
+                    if (child !== primaryChild) {
+                      removeNode(child);
+                    }
+                  }
+                }
+              }
+            }
+            """
+        )
+    except Exception:
+        pass
+
+
+def _tweet_card_matches_id(tweet_card, tweet_id: str) -> bool:
+    try:
+        return bool(
+            tweet_card.evaluate(
+                """
+                (el, tweetId) => {
+                  if (el.getAttribute('data-tweet-id') === tweetId) {
+                    return true;
+                  }
+                  if (el.querySelector(`article[data-tweet-id="${tweetId}"]`)) {
+                    return true;
+                  }
+                  if (el.querySelector(`a[href*="/status/${tweetId}"]`)) {
+                    return true;
+                  }
+                  return false;
+                }
+                """,
+                tweet_id,
             )
         )
-        locators.extend(
+    except Exception:
+        return False
+
+
+def _wait_for_tweet_card(page, tweet_id: str, timeout_ms: int):
+    permalink = page.locator(
+        ",".join(
             [
-                page.locator("article[data-testid='tweet']").filter(has=permalink).first,
-                page.locator("article[data-testid='tweet']").first,
-                page.locator("[data-testid='cellInnerDiv']").filter(has=permalink).locator("article[data-testid='tweet']").first,
-                page.locator("[data-testid='cellInnerDiv']").first,
+                f"a[href*='/status/{tweet_id}']",
+                f"a[href*='/i/web/status/{tweet_id}']",
+                f"a[href$='/{tweet_id}']",
             ]
         )
-    else:
-        locators.extend(
-            [
-                page.locator("article").first,
-                page.locator("main article").first,
-            ]
-        )
+    )
+    locators = [
+        page.locator(f'article[data-tweet-id="{tweet_id}"]').first,
+        page.locator("article").filter(has=permalink).first,
+        page.locator("article[data-testid='tweet']").filter(has=permalink).first,
+        page.locator("[data-testid='cellInnerDiv']").filter(has=permalink).locator("article").first,
+        page.locator("main article").filter(has=permalink).first,
+        page.locator("main article").first,
+    ]
+
+    deadline = time.monotonic() + (timeout_ms / 1000)
+    per_locator_ms = max(2500, timeout_ms // max(len(locators), 1))
 
     for locator in locators:
+        remaining_ms = int(max(0, (deadline - time.monotonic()) * 1000))
+        if remaining_ms <= 0:
+            break
+        slot_ms = min(per_locator_ms, remaining_ms)
         try:
-            locator.wait_for(state="visible", timeout=timeout_ms)
-            return locator
+            locator.wait_for(state="visible", timeout=slot_ms)
+            if _tweet_card_matches_id(locator, tweet_id):
+                return locator
         except PlaywrightTimeoutError:
             continue
     return None
 
 
-def _scroll_tweet_into_view(page, tweet_card) -> None:
+def _scroll_tweet_into_view(page, tweet_card, *, guest_mode: bool = False) -> None:
     tweet_card.scroll_into_view_if_needed(timeout=10000)
-    page.wait_for_timeout(500)
+    page.wait_for_timeout(GUEST_POST_SCROLL_MS if guest_mode else 500)
 
     box = tweet_card.bounding_box()
     if not box:
         return
 
-    target_top = max(int(box["y"] - 120), 0)
+    top_padding = 16 if guest_mode else 120
+    target_top = max(int(box["y"] - top_padding), 0)
     page.evaluate("(top) => window.scrollTo(0, top)", target_top)
-    page.wait_for_timeout(700)
+    page.wait_for_timeout(300 if guest_mode else 700)
 
 
 def _wait_for_tweet_assets(page, tweet_card) -> None:
@@ -448,35 +625,84 @@ def _fetch_translation_payload(url: str) -> object | None:
         return None
 
 
+_TEXT_ANCHOR_COLLECTION_JS = f"""
+(root) => {{
+  const isVisible = (node) => {{
+    if (!(node instanceof Element)) {{
+      return false;
+    }}
+    const style = window.getComputedStyle(node);
+    if (!style) {{
+      return false;
+    }}
+    if (style.display === 'none' || style.visibility === 'hidden') {{
+      return false;
+    }}
+    const rect = node.getBoundingClientRect();
+    return rect.width >= 8 && rect.height >= 8;
+  }};
+
+  const isTweetBodyText = (node) => {{
+    if (!(node instanceof Element)) {{
+      return false;
+    }}
+    if (node.closest('[data-testid="User-Name"]')) {{
+      return false;
+    }}
+    if (node.closest('[data-testid="socialContext"]')) {{
+      return false;
+    }}
+    if (node.closest('[role="group"]')) {{
+      return false;
+    }}
+    if (node.closest('[{TRANSLATION_ATTR}="block"]')) {{
+      return false;
+    }}
+    return true;
+  }};
+
+  const seen = new Set();
+  const anchors = [];
+  const pushNode = (node) => {{
+    const text = (node.innerText || '').trim();
+    if (!text || text.length < 8 || seen.has(text)) {{
+      return;
+    }}
+    seen.add(text);
+    anchors.push(node);
+  }};
+
+  const selectors = [
+    '[data-testid="tweetText"]',
+    'div[dir="auto"]',
+  ];
+  for (const selector of selectors) {{
+    for (const node of root.querySelectorAll(selector)) {{
+      if (!isVisible(node) || !isTweetBodyText(node)) {{
+        continue;
+      }}
+      pushNode(node);
+    }}
+  }}
+
+  return anchors;
+}}
+"""
+
+
 def _extract_translatable_text_blocks(tweet_card) -> list[dict[str, str | int | None]]:
     try:
         blocks = tweet_card.evaluate(
-            """
-            (root) => {
-              const isVisible = (node) => {
-                if (!(node instanceof Element)) {
-                  return false;
-                }
-                const style = window.getComputedStyle(node);
-                if (!style) {
-                  return false;
-                }
-                if (style.display === 'none' || style.visibility === 'hidden') {
-                  return false;
-                }
-                const rect = node.getBoundingClientRect();
-                return rect.width >= 8 && rect.height >= 8;
-              };
-
-              return [...root.querySelectorAll('[data-testid="tweetText"]')]
-                .filter((node) => isVisible(node))
-                .map((node, index) => ({
-                  index,
-                  text: (node.innerText || '').trim(),
-                  lang: node.getAttribute('lang') || node.querySelector('[lang]')?.getAttribute('lang') || '',
-                }))
-                .filter((item) => item.text);
-            }
+            f"""
+            (root) => {{
+              const collectAnchors = {_TEXT_ANCHOR_COLLECTION_JS};
+              const anchors = collectAnchors(root);
+              return anchors.map((node, index) => ({{
+                index,
+                text: (node.innerText || '').trim(),
+                lang: node.getAttribute('lang') || node.querySelector('[lang]')?.getAttribute('lang') || '',
+              }}));
+            }}
             """
         )
     except Exception:
@@ -677,27 +903,16 @@ def _inject_chinese_translations(
         inserted = tweet_card.evaluate(
             f"""
             (root, entries) => {{
-              const isVisible = (node) => {{
-                if (!(node instanceof Element)) {{
-                  return false;
-                }}
-                const style = window.getComputedStyle(node);
-                if (!style) {{
-                  return false;
-                }}
-                if (style.display === 'none' || style.visibility === 'hidden') {{
-                  return false;
-                }}
-                const rect = node.getBoundingClientRect();
-                return rect.width >= 8 && rect.height >= 8;
-              }};
+              const collectAnchors = {_TEXT_ANCHOR_COLLECTION_JS};
 
               root.querySelectorAll('[{TRANSLATION_ATTR}="block"]').forEach((node) => node.remove());
-              const blocks = [...root.querySelectorAll('[data-testid="tweetText"]')].filter((node) => isVisible(node));
+              const blocks = collectAnchors(root);
               let count = 0;
 
               for (const entry of entries) {{
-                const anchor = blocks[entry.index];
+                const anchor =
+                  blocks[entry.index] ||
+                  blocks.find((node) => (node.innerText || '').trim() === (entry.text || '').trim());
                 if (!anchor || !entry.translation) {{
                   continue;
                 }}
@@ -1126,36 +1341,49 @@ def _prepare_video_frames(
               };
 
               const hideVideoOverlays = () => {
-                const videoRect = video.getBoundingClientRect();
-                const videoArea = videoRect.width * videoRect.height;
-                if (videoArea < 1) {
+                video.controls = false;
+
+                const root = playerRoot instanceof HTMLElement ? playerRoot : video.parentElement;
+                if (!(root instanceof HTMLElement)) {
                   return;
                 }
 
-                const overlapRatio = (rect) => {
-                  const width = Math.max(0, Math.min(videoRect.right, rect.right) - Math.max(videoRect.left, rect.left));
-                  const height = Math.max(0, Math.min(videoRect.bottom, rect.bottom) - Math.max(videoRect.top, rect.top));
-                  return (width * height) / videoArea;
-                };
-
-                const overlayNodes = playerRoot
-                  ? playerRoot.querySelectorAll('img, button, [role="button"], svg')
-                  : [];
-
-                overlayNodes.forEach((node) => {
-                  if (!(node instanceof HTMLElement) || node === video || node.contains(video)) {
+                root.querySelectorAll(
+                  'button,[role="button"],[role="progressbar"],[role="slider"],input[type="range"],svg,img,span',
+                ).forEach((node) => {
+                  if (!(node instanceof HTMLElement) || node === video || video.contains(node)) {
                     return;
+                  }
+                  node.style.setProperty('display', 'none', 'important');
+                  node.style.setProperty('opacity', '0', 'important');
+                  node.style.setProperty('visibility', 'hidden', 'important');
+                });
+
+                const rootRect = root.getBoundingClientRect();
+                for (const node of root.querySelectorAll('div')) {
+                  if (!(node instanceof HTMLElement) || node === video || video.contains(node) || node.contains(video)) {
+                    continue;
                   }
                   const rect = node.getBoundingClientRect();
-                  if (rect.width < 20 || rect.height < 20) {
-                    return;
+                  if (rect.width < rootRect.width * 0.45 || rect.height < 4 || rect.height > 96) {
+                    continue;
                   }
-                  if (overlapRatio(rect) < 0.55) {
-                    return;
+                  if (rect.bottom >= rootRect.bottom - 8 && rect.top >= rootRect.bottom - 100) {
+                    node.style.setProperty('display', 'none', 'important');
+                    node.style.setProperty('background', 'transparent', 'important');
                   }
-                  node.style.opacity = '0';
-                  node.style.pointerEvents = 'none';
-                });
+                }
+
+                const videoRect = video.getBoundingClientRect();
+                if (videoRect.height > 0) {
+                  const topOffset = Math.max(0, videoRect.top - rootRect.top);
+                  const targetHeight = Math.ceil(topOffset + videoRect.height);
+                  root.style.height = `${targetHeight}px`;
+                  root.style.maxHeight = `${targetHeight}px`;
+                  root.style.overflow = 'hidden';
+                  root.style.background = 'transparent';
+                  root.style.paddingBottom = '0';
+                }
               };
 
               const renderTargetFrame = async (desiredTime, duration) => {
@@ -1300,13 +1528,393 @@ def _prepare_video_frames(
     return tuple(frames)
 
 
+def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
+    try:
+        tweet_card.evaluate(
+            """
+            (root) => {
+              const GRID_ATTR = 'data-resource-snapshot-media-grid';
+
+              const isAvatarImage = (img) => {
+                if (!(img instanceof HTMLImageElement)) {
+                  return false;
+                }
+                return Boolean(
+                  img.closest(
+                    '[data-testid="Tweet-User-Avatar"], [data-testid="UserAvatar-Container-Unknown"], [data-testid="User-Name"]',
+                  ),
+                );
+              };
+
+              const isMediaImage = (img) => {
+                if (!(img instanceof HTMLImageElement)) {
+                  return false;
+                }
+                if (isAvatarImage(img)) {
+                  return false;
+                }
+                return img.naturalWidth > 80;
+              };
+
+              const removeNode = (node) => {
+                if (node instanceof Element) {
+                  node.remove();
+                }
+              };
+
+              for (const btn of root.querySelectorAll('button, [role="button"]')) {
+                const label = (btn.getAttribute('aria-label') || btn.textContent || '').trim();
+                if (/^(next|previous|上一|下一|次|前)/i.test(label)) {
+                  removeNode(btn);
+                }
+              }
+
+              root.querySelectorAll(`[${GRID_ATTR}]`).forEach(removeNode);
+
+              const carousels = [...root.querySelectorAll('div')].filter((node) => {
+                if (!(node instanceof HTMLElement)) {
+                  return false;
+                }
+                const cls = typeof node.className === 'string' ? node.className : '';
+                return cls.includes('snap-x') && cls.includes('snap-mandatory');
+              });
+
+              const buildGridCell = (img) => {
+                const cell = document.createElement('div');
+                cell.style.position = 'relative';
+                cell.style.overflow = 'hidden';
+                cell.style.minWidth = '0';
+                cell.style.minHeight = '0';
+                cell.style.width = '100%';
+                cell.style.height = '100%';
+
+                const clone = img.cloneNode(true);
+                clone.removeAttribute('style');
+                clone.className = '';
+                clone.style.width = '100%';
+                clone.style.height = '100%';
+                clone.style.objectFit = 'cover';
+                clone.style.display = 'block';
+                cell.appendChild(clone);
+                return cell;
+              };
+
+              for (const carousel of carousels) {
+                const slides = [...carousel.children].filter((child) => child.querySelector('img'));
+                const images = slides
+                  .map((slide) => slide.querySelector('img'))
+                  .filter((img) => isMediaImage(img));
+
+                if (images.length === 0) {
+                  continue;
+                }
+
+                if (images.length === 1) {
+                  carousel.style.display = 'block';
+                  carousel.style.overflow = 'hidden';
+                  carousel.style.width = '100%';
+                  carousel.style.borderRadius = '16px';
+                  for (const slide of slides) {
+                    slide.style.width = '100%';
+                    slide.style.maxWidth = '100%';
+                    slide.style.flexShrink = '0';
+                  }
+                  const img = images[0];
+                  img.style.width = '100%';
+                  img.style.height = 'auto';
+                  img.style.objectFit = 'cover';
+                  img.style.display = 'block';
+                  img.style.borderRadius = '16px';
+                  continue;
+                }
+
+                const grid = document.createElement('div');
+                grid.setAttribute(GRID_ATTR, 'true');
+                grid.style.display = 'grid';
+                grid.style.width = '100%';
+                grid.style.gap = '2px';
+                grid.style.borderRadius = '16px';
+                grid.style.overflow = 'hidden';
+
+                if (images.length === 2) {
+                  grid.style.gridTemplateColumns = '1fr 1fr';
+                  grid.style.gridTemplateRows = '1fr';
+                  grid.style.aspectRatio = '16 / 9';
+                  for (const img of images.slice(0, 2)) {
+                    grid.appendChild(buildGridCell(img));
+                  }
+                } else if (images.length === 3) {
+                  grid.style.gridTemplateColumns = '1fr 1fr';
+                  grid.style.gridTemplateRows = '1fr 1fr';
+                  grid.style.aspectRatio = '4 / 3';
+                  const cells = images.slice(0, 3).map((img) => buildGridCell(img));
+                  cells[0].style.gridRow = '1 / span 2';
+                  cells[0].style.gridColumn = '1';
+                  cells[1].style.gridRow = '1';
+                  cells[1].style.gridColumn = '2';
+                  cells[2].style.gridRow = '2';
+                  cells[2].style.gridColumn = '2';
+                  for (const cell of cells) {
+                    grid.appendChild(cell);
+                  }
+                } else {
+                  grid.style.gridTemplateColumns = '1fr 1fr';
+                  grid.style.gridTemplateRows = '1fr 1fr';
+                  grid.style.aspectRatio = '1 / 1';
+                  for (const img of images.slice(0, 4)) {
+                    grid.appendChild(buildGridCell(img));
+                  }
+                }
+
+                carousel.replaceWith(grid);
+              }
+
+              const photoRoot = root.querySelector('[data-testid="tweetPhoto"]');
+              if (photoRoot instanceof HTMLElement) {
+                photoRoot.style.borderRadius = '16px';
+                photoRoot.style.overflow = 'hidden';
+              }
+            }
+            """
+        )
+    except Exception:
+        pass
+
+
+def _prepare_tweet_for_screenshot(tweet_card) -> None:
+    _prepare_tweet_media_for_screenshot(tweet_card)
+    try:
+        tweet_card.evaluate(
+            """
+            (root) => {
+              const isVisible = (node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === 'none' || style.visibility === 'hidden') {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width >= 8 && rect.height >= 8;
+              };
+
+              const removeNode = (node) => {
+                if (node instanceof Element) {
+                  node.remove();
+                }
+              };
+
+              const replySelectors = [
+                '[data-testid="logged_out_read_replies_pivot"]',
+                '[data-testid="inline_reply_offscreen"]',
+                '[data-testid="reply"]',
+              ];
+              for (const selector of replySelectors) {
+                root.querySelectorAll(selector).forEach(removeNode);
+              }
+
+              root.querySelectorAll('a, button, [role="button"], div, span').forEach((node) => {
+                const text = (node.textContent || '').trim();
+                if (!text || text.length > 80) {
+                  return;
+                }
+                if (
+                  /^(Read|View|See)\\s+\\d+\\s+repl/i.test(text) ||
+                  /^阅读\\s*\\d+/.test(text) ||
+                  /^查看\\s*\\d+/.test(text) ||
+                  /^\\d+\\s*条回复/.test(text)
+                ) {
+                  removeNode(node);
+                }
+              });
+
+              const tweetRoot = root.matches('article') ? root : root.querySelector('article') || root;
+              tweetRoot.style.width = '100%';
+              tweetRoot.style.maxWidth = '598px';
+              tweetRoot.style.marginLeft = 'auto';
+              tweetRoot.style.marginRight = 'auto';
+
+              const rootRect = tweetRoot.getBoundingClientRect();
+              const actionGroups = [...tweetRoot.querySelectorAll('[role="group"]')]
+                .filter(isVisible)
+                .map((node) => {
+                  const rect = node.getBoundingClientRect();
+                  return {
+                    node,
+                    rect,
+                    text: (node.innerText || '').trim(),
+                  };
+                })
+                .filter((entry) => {
+                  if (entry.rect.width < 220 || entry.rect.height < 12) {
+                    return false;
+                  }
+                  const nearBottom = entry.rect.bottom >= rootRect.top + rootRect.height * 0.62;
+                  const looksLikeEngagement = /reply|repost|like|bookmark|share|回复|转推|喜欢|收藏|分享/i.test(
+                    entry.text,
+                  );
+                  return nearBottom || looksLikeEngagement;
+                });
+              const actionBar = actionGroups.sort(
+                (a, b) => b.rect.bottom - a.rect.bottom,
+              )[0]?.node;
+
+              if (actionBar) {
+                const removeFollowing = (container, pivot) => {
+                  let seen = false;
+                  for (const child of [...container.children]) {
+                    if (seen) {
+                      removeNode(child);
+                      continue;
+                    }
+                    if (child === pivot || child.contains(pivot)) {
+                      seen = true;
+                    }
+                  }
+                };
+
+                let pivot = actionBar;
+                while (pivot && pivot !== tweetRoot) {
+                  const parent = pivot.parentElement;
+                  if (!parent) {
+                    break;
+                  }
+                  removeFollowing(parent, pivot);
+                  if (parent === tweetRoot) {
+                    break;
+                  }
+                  pivot = parent;
+                }
+              }
+
+              for (const node of root.querySelectorAll('div, aside, section')) {
+                if (!(node instanceof HTMLElement)) {
+                  continue;
+                }
+                const text = (node.innerText || '').trim();
+                if (!text || text.length > 220) {
+                  continue;
+                }
+                if (
+                  /don't miss what's happening|sign up now to get your own|people on x are the first/i.test(
+                    text,
+                  )
+                ) {
+                  removeNode(node);
+                }
+              }
+
+              const hideVideoControlChrome = (video) => {
+                const playerRoot =
+                  video.closest('[data-testid="videoComponent"]') ||
+                  video.closest('[data-testid="videoPlayer"]') ||
+                  video.parentElement;
+                if (!(playerRoot instanceof HTMLElement)) {
+                  return;
+                }
+
+                video.controls = false;
+                playerRoot.querySelectorAll(
+                  'button,[role="button"],[role="progressbar"],[role="slider"],input[type="range"],svg,img,span',
+                ).forEach((node) => {
+                  if (!(node instanceof HTMLElement) || node === video || video.contains(node)) {
+                    return;
+                  }
+                  node.style.setProperty('display', 'none', 'important');
+                });
+
+                const rootRect = playerRoot.getBoundingClientRect();
+                for (const node of playerRoot.querySelectorAll('div')) {
+                  if (!(node instanceof HTMLElement) || node === video || video.contains(node) || node.contains(video)) {
+                    continue;
+                  }
+                  const rect = node.getBoundingClientRect();
+                  if (rect.width < rootRect.width * 0.45 || rect.height < 4 || rect.height > 96) {
+                    continue;
+                  }
+                  if (rect.bottom >= rootRect.bottom - 8 && rect.top >= rootRect.bottom - 100) {
+                    node.style.setProperty('display', 'none', 'important');
+                    node.style.setProperty('background', 'transparent', 'important');
+                  }
+                }
+
+                const videoRect = video.getBoundingClientRect();
+                if (videoRect.height > 0) {
+                  const topOffset = Math.max(0, videoRect.top - rootRect.top);
+                  const targetHeight = Math.ceil(topOffset + videoRect.height);
+                  playerRoot.style.height = `${targetHeight}px`;
+                  playerRoot.style.maxHeight = `${targetHeight}px`;
+                  playerRoot.style.overflow = 'hidden';
+                  playerRoot.style.background = 'transparent';
+                  playerRoot.style.paddingBottom = '0';
+                }
+              };
+
+              const trimVideoContainer = (video) => {
+                const rect = video.getBoundingClientRect();
+                if (rect.width < 1 || rect.height < 1) {
+                  return;
+                }
+
+                let sourceWidth = video.videoWidth;
+                let sourceHeight = video.videoHeight;
+                if (!sourceWidth || !sourceHeight) {
+                  sourceWidth = rect.width;
+                  sourceHeight = rect.height;
+                }
+                if (!sourceWidth || !sourceHeight) {
+                  return;
+                }
+
+                const aspect = sourceWidth / sourceHeight;
+                const targetWidth = Math.min(rect.height * aspect, rect.width);
+                const chain = [];
+                let current = video;
+                while (current && current !== tweetRoot) {
+                  chain.push(current);
+                  current = current.parentElement;
+                }
+
+                for (const node of chain) {
+                  if (!(node instanceof HTMLElement)) {
+                    continue;
+                  }
+                  node.style.width = `${targetWidth}px`;
+                  node.style.maxWidth = `${targetWidth}px`;
+                  node.style.minWidth = '0';
+                  node.style.marginLeft = 'auto';
+                  node.style.marginRight = 'auto';
+                  node.style.background = 'transparent';
+                  node.style.overflow = 'hidden';
+                }
+
+                video.style.width = '100%';
+                video.style.height = 'auto';
+                video.style.objectFit = 'contain';
+                video.style.background = 'transparent';
+              };
+
+              for (const video of root.querySelectorAll('video')) {
+                if (!isVisible(video)) {
+                  continue;
+                }
+                hideVideoControlChrome(video);
+                trimVideoContainer(video);
+              }
+            }
+            """
+        )
+    except Exception:
+        pass
+
+
 def _compute_capture_clip(page, tweet_card):
     element = tweet_card.element_handle(timeout=5000)
     if element is None:
         return None
 
-    return page.evaluate(
-        """
+    clip_script = """
         (el) => {
           const doc = document.documentElement;
           const rootRect = el.getBoundingClientRect();
@@ -1314,6 +1922,7 @@ def _compute_capture_clip(page, tweet_card):
           const excludedSelector = [
             '[data-testid="logged_out_read_replies_pivot"]',
             '[data-testid="inline_reply_offscreen"]',
+            '[data-testid="reply"]',
             '[data-testid="tweetTextarea_0"]',
             '[data-testid="inline_reply_composer"]',
             '[contenteditable="true"][role="textbox"]',
@@ -1385,11 +1994,61 @@ def _compute_capture_clip(page, tweet_card):
 
           textRects();
 
+          const headerSelector = [
+            '[data-testid="User-Name"]',
+            '[data-testid="Tweet-User-Avatar"]',
+            '[data-testid="UserAvatar-Container-Unknown"]',
+          ].join(', ');
+          for (const node of el.querySelectorAll(headerSelector)) {
+            if (!isVisible(node)) {
+              continue;
+            }
+            addRect(node.getBoundingClientRect());
+          }
+
+          const isTweetBodyText = (node) => {
+            if (!(node instanceof Element)) {
+              return false;
+            }
+            if (node.closest('[data-testid="User-Name"]')) {
+              return false;
+            }
+            if (node.closest('[data-testid="socialContext"]')) {
+              return false;
+            }
+            if (node.closest('[role="group"]')) {
+              return false;
+            }
+            return true;
+          };
+
+          for (const selector of ['[data-testid="tweetText"]', 'div[dir="auto"]']) {
+            for (const node of el.querySelectorAll(selector)) {
+              if (!isVisible(node) || shouldExclude(node) || !isTweetBodyText(node)) {
+                continue;
+              }
+              addRect(node.getBoundingClientRect());
+            }
+          }
+
+          for (const node of el.querySelectorAll('[__TRANSLATION_ATTR__="block"]')) {
+            if (!isVisible(node)) {
+              continue;
+            }
+            addRect(node.getBoundingClientRect());
+          }
+
           for (const node of el.querySelectorAll(mediaSelector)) {
             if (!isVisible(node)) {
               continue;
             }
             if (shouldExclude(node)) {
+              continue;
+            }
+            if (
+              node instanceof HTMLImageElement &&
+              node.closest('[data-testid="Tweet-User-Avatar"], [data-testid="UserAvatar-Container-Unknown"], [data-testid="User-Name"]')
+            ) {
               continue;
             }
             for (const rect of node.getClientRects()) {
@@ -1406,9 +2065,19 @@ def _compute_capture_clip(page, tweet_card):
                 bottom: rect.bottom + window.scrollY,
                 width: rect.width,
                 height: rect.height,
+                text: (node.innerText || '').trim(),
               };
             })
-            .filter((rect) => rect.width > 40 && rect.height > 12);
+            .filter((rect) => {
+              if (rect.width < 220 || rect.height < 12) {
+                return false;
+              }
+              const nearBottom = rect.bottom >= rootRect.top + rootRect.height * 0.62;
+              const looksLikeEngagement = /reply|repost|like|bookmark|share|回复|转推|喜欢|收藏|分享/i.test(
+                rect.text,
+              );
+              return nearBottom || looksLikeEngagement;
+            });
 
           const actionBar = actionGroups.sort((a, b) => b.bottom - a.bottom)[0];
 
@@ -1423,10 +2092,10 @@ def _compute_capture_clip(page, tweet_card):
             right = rootRight;
             bottom = rootBottom;
           } else {
-            // Keep the full tweet-card header visible, including avatar and author line.
-            left = Math.min(left, rootX);
             top = Math.min(top, rootY);
-            right = Math.max(right, rootRight);
+            left = Math.max(left, rootX);
+            right = Math.min(right, rootRight);
+            bottom = Math.max(bottom, rootBottom);
           }
 
           const padding = 12;
@@ -1440,7 +2109,10 @@ def _compute_capture_clip(page, tweet_card):
 
           return { x, y, width, height };
         }
-        """,
+        """.replace("__TRANSLATION_ATTR__", TRANSLATION_ATTR)
+
+    return page.evaluate(
+        clip_script,
         arg=element,
     )
 
@@ -1453,7 +2125,7 @@ def _ensure_viewport_can_fit_clip(page, clip: dict[str, int] | None) -> bool:
         "width": DEFAULT_VIEWPORT_WIDTH,
         "height": DEFAULT_VIEWPORT_HEIGHT,
     }
-    required_width = max(int(clip["width"]) + CAPTURE_VIEWPORT_MARGIN, DEFAULT_VIEWPORT_WIDTH)
+    required_width = max(int(clip["width"]) + CAPTURE_VIEWPORT_MARGIN, min(viewport["width"], 760))
     required_height = max(int(clip["height"]) + CAPTURE_VIEWPORT_MARGIN, DEFAULT_VIEWPORT_HEIGHT)
 
     if required_width <= viewport["width"] and required_height <= viewport["height"]:
@@ -1470,10 +2142,19 @@ def _ensure_viewport_can_fit_clip(page, clip: dict[str, int] | None) -> bool:
 
 
 def _capture_detail_snapshot(page, tweet_card, path: Path) -> None:
+    _hide_non_primary_columns(page)
+    _scroll_tweet_into_view(page, tweet_card, guest_mode=True)
+
     clip = _compute_capture_clip(page, tweet_card)
     if _ensure_viewport_can_fit_clip(page, clip):
         _wait_for_tweet_assets(page, tweet_card)
+        page.wait_for_timeout(200)
+        _scroll_tweet_into_view(page, tweet_card, guest_mode=True)
         clip = _compute_capture_clip(page, tweet_card)
+        if _ensure_viewport_can_fit_clip(page, clip):
+            page.wait_for_timeout(200)
+            _scroll_tweet_into_view(page, tweet_card, guest_mode=True)
+            clip = _compute_capture_clip(page, tweet_card)
 
     if clip:
         page.screenshot(
@@ -1505,55 +2186,133 @@ def _build_output_name(detail_url: str, output_dir: Path) -> str:
     return candidate
 
 
-def _create_capture_context(playwright, browser_profile: Path, *, headless: bool, dark_mode: bool, wait_timeout_ms: int):
+@dataclass(frozen=True)
+class BrowserSession:
+    page: object
+    close: Callable[[], None]
+
+
+def _configure_page(page, *, dark_mode: bool, wait_timeout_ms: int) -> None:
+    page.set_default_timeout(wait_timeout_ms)
+    page.set_default_navigation_timeout(wait_timeout_ms)
+    page.emulate_media(color_scheme="dark" if dark_mode else "light")
+
+
+def _apply_chinese_locale(context) -> None:
+    try:
+        context.add_init_script(
+            """
+            () => {
+              Object.defineProperty(navigator, 'language', { get: () => 'zh-CN' });
+              Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US'] });
+              document.documentElement.lang = 'zh-CN';
+            }
+            """
+        )
+        context.add_cookies(
+            [
+                {"name": "lang", "value": "zh-cn", "domain": ".x.com", "path": "/"},
+                {"name": "lang", "value": "zh-cn", "domain": ".twitter.com", "path": "/"},
+            ]
+        )
+    except Exception:
+        pass
+
+
+def _open_capture_session(
+    playwright,
+    browser_profile: Path,
+    *,
+    headless: bool,
+    dark_mode: bool,
+    wait_timeout_ms: int,
+    guest_mode: bool,
+) -> BrowserSession:
+    if guest_mode:
+        browser = playwright.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            viewport={"width": GUEST_VIEWPORT_WIDTH, "height": GUEST_VIEWPORT_HEIGHT},
+            device_scale_factor=CAPTURE_DEVICE_SCALE_FACTOR,
+            color_scheme="dark" if dark_mode else "light",
+            user_agent=GUEST_USER_AGENT,
+            locale=DEFAULT_LOCALE,
+            timezone_id=DEFAULT_TIMEZONE,
+            extra_http_headers={
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            },
+        )
+        _apply_chinese_locale(context)
+        page = context.new_page()
+        _configure_page(page, dark_mode=dark_mode, wait_timeout_ms=wait_timeout_ms)
+
+        def close() -> None:
+            context.close()
+            browser.close()
+
+        return BrowserSession(page=page, close=close)
+
     context = playwright.chromium.launch_persistent_context(
         str(browser_profile),
         headless=headless,
         viewport={"width": DEFAULT_VIEWPORT_WIDTH, "height": DEFAULT_VIEWPORT_HEIGHT},
-        device_scale_factor=2,
-        locale="zh-CN",
+        device_scale_factor=CAPTURE_DEVICE_SCALE_FACTOR,
+        locale=DEFAULT_LOCALE,
+        timezone_id=DEFAULT_TIMEZONE,
         color_scheme="dark" if dark_mode else "light",
         ignore_https_errors=True,
         args=["--disable-blink-features=AutomationControlled"],
+        extra_http_headers={
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        },
     )
+    _apply_chinese_locale(context)
     page = context.pages[0] if context.pages else context.new_page()
-    page.set_default_timeout(wait_timeout_ms)
-    page.set_default_navigation_timeout(wait_timeout_ms)
-    page.emulate_media(color_scheme="dark" if dark_mode else "light")
-    return context, page
+    _configure_page(page, dark_mode=dark_mode, wait_timeout_ms=wait_timeout_ms)
+
+    def close() -> None:
+        context.close()
+
+    return BrowserSession(page=page, close=close)
 
 
-def _load_tweet_card(page, normalized_url: str, screen_name: str, tweet_id: str, *, dark_mode: bool, wait_timeout_ms: int):
+def _load_tweet_card(
+    page,
+    normalized_url: str,
+    screen_name: str,
+    tweet_id: str,
+    *,
+    dark_mode: bool,
+    wait_timeout_ms: int,
+    guest_mode: bool = False,
+):
     last_error: Exception | None = None
 
     for candidate_url, mode in _candidate_urls(normalized_url, screen_name, tweet_id):
         try:
-            active_url = candidate_url
-            if mode == "embed_card" and dark_mode:
-                active_url = f"{candidate_url}&theme=dark"
+            page.goto(candidate_url, wait_until="domcontentloaded")
+            if guest_mode:
+                page.wait_for_timeout(GUEST_PAGE_SETTLE_MS)
+            else:
+                try:
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                except PlaywrightTimeoutError:
+                    pass
+                _dismiss_common_overlays(page)
 
-            page.goto(active_url, wait_until="domcontentloaded")
-            try:
-                page.wait_for_load_state("networkidle", timeout=5000)
-            except PlaywrightTimeoutError:
-                pass
-
-            _dismiss_common_overlays(page)
-
-            tweet_card = _wait_for_tweet_card(
-                page,
-                tweet_id,
-                mode,
-                wait_timeout_ms if mode == "detail_page" else 12000,
-            )
+            tweet_card = _wait_for_tweet_card(page, tweet_id, wait_timeout_ms)
             if tweet_card is None:
                 raise RuntimeError("页面里没有找到可截图的推文主体")
 
-            page.add_style_tag(
-                content=_detail_capture_css(dark_mode) if mode == "detail_page" else _embed_capture_css(dark_mode)
-            )
-            _dismiss_common_overlays(page)
-            return tweet_card, active_url, mode
+            _expand_tweet_text(tweet_card)
+            page.wait_for_timeout(250)
+            page.add_style_tag(content=_detail_capture_css(dark_mode))
+            _hide_non_primary_columns(page)
+            if not guest_mode:
+                _dismiss_common_overlays(page)
+            return tweet_card, candidate_url, mode
         except Exception as exc:
             last_error = exc
             continue
@@ -1579,16 +2338,19 @@ def preview_tweet_translations(
 
     browser_profile = Path(profile_dir)
     browser_profile.mkdir(parents=True, exist_ok=True)
-    wait_timeout_ms = 90000 if not headless else 25000
+    guest_mode = headless
+    wait_timeout_ms = 90000 if not headless else 30000
 
     with sync_playwright() as playwright:
-        context, page = _create_capture_context(
+        session = _open_capture_session(
             playwright,
             browser_profile,
             headless=headless,
             dark_mode=dark_mode,
             wait_timeout_ms=wait_timeout_ms,
+            guest_mode=guest_mode,
         )
+        page = session.page
         try:
             tweet_card, used_url, capture_mode = _load_tweet_card(
                 page,
@@ -1597,6 +2359,7 @@ def preview_tweet_translations(
                 tweet_id,
                 dark_mode=dark_mode,
                 wait_timeout_ms=wait_timeout_ms,
+                guest_mode=guest_mode,
             )
             _wait_for_tweet_assets(page, tweet_card)
 
@@ -1611,7 +2374,7 @@ def preview_tweet_translations(
                 for item in _build_translation_items(text_blocks)
             )
         finally:
-            context.close()
+            session.close()
 
     return TranslationPreviewResult(
         items=items,
@@ -1654,16 +2417,19 @@ def capture_tweet_page(
         schedule = {"byIndex": {}, "named": {}}
         if video_timestamp_seconds is not None:
             schedule["byIndex"]["0"] = video_timestamp_seconds
-    wait_timeout_ms = 90000 if not headless else 25000
+    guest_mode = headless
+    wait_timeout_ms = 90000 if not headless else 30000
 
     with sync_playwright() as playwright:
-        context, page = _create_capture_context(
+        session = _open_capture_session(
             playwright,
             browser_profile,
             headless=headless,
             dark_mode=dark_mode,
             wait_timeout_ms=wait_timeout_ms,
+            guest_mode=guest_mode,
         )
+        page = session.page
 
         try:
             tweet_card, used_url, capture_mode = _load_tweet_card(
@@ -1673,8 +2439,11 @@ def capture_tweet_page(
                 tweet_id,
                 dark_mode=dark_mode,
                 wait_timeout_ms=wait_timeout_ms,
+                guest_mode=guest_mode,
             )
             _wait_for_tweet_assets(page, tweet_card)
+            _expand_tweet_text(tweet_card)
+            page.wait_for_timeout(200)
             if translate_body:
                 _inject_chinese_translations(
                     tweet_card,
@@ -1682,21 +2451,17 @@ def capture_tweet_page(
                     translation_overrides=translation_overrides,
                 )
                 _remove_native_translation_ui(tweet_card)
-            _scroll_tweet_into_view(page, tweet_card)
+            _scroll_tweet_into_view(page, tweet_card, guest_mode=guest_mode)
             page.wait_for_timeout(250)
             video_frames = _prepare_video_frames(tweet_card, schedule)
             if video_frames:
                 video_frame_seconds = video_frames[0].seconds
 
-            if capture_mode == "detail_page":
-                _capture_detail_snapshot(page, tweet_card, saved_to)
-            else:
-                tweet_card.screenshot(
-                    path=str(saved_to),
-                    animations="disabled",
-                )
+            _prepare_tweet_for_screenshot(tweet_card)
+            page.wait_for_timeout(200)
+            _capture_detail_snapshot(page, tweet_card, saved_to)
         finally:
-            context.close()
+            session.close()
 
     return CaptureResult(
         file_name=file_name,
