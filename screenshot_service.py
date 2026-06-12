@@ -101,8 +101,7 @@ body {{
 header[role="banner"],
 [data-testid="logged_out_read_replies_pivot"],
 [data-testid="inline_reply_offscreen"],
-[data-testid="tweet-text-show-more-link"],
-[data-testid="reply"] {{
+[data-testid="tweet-text-show-more-link"] {{
   display: none !important;
 }}
 
@@ -1708,21 +1707,19 @@ def _prepare_tweet_for_screenshot(tweet_card) -> None:
               const replySelectors = [
                 '[data-testid="logged_out_read_replies_pivot"]',
                 '[data-testid="inline_reply_offscreen"]',
-                '[data-testid="reply"]',
               ];
               for (const selector of replySelectors) {
                 root.querySelectorAll(selector).forEach(removeNode);
               }
 
-              root.querySelectorAll('a, button, [role="button"], div, span').forEach((node) => {
+              root.querySelectorAll('a, button, [role="button"], span').forEach((node) => {
                 const text = (node.textContent || '').trim();
                 if (!text || text.length > 80) {
                   return;
                 }
                 if (
-                  /^(Read|View|See)\\s+\\d+\\s+repl/i.test(text) ||
+                  /^(Read|See)\\s+\\d+[\\d,]*\\s+repl/i.test(text) ||
                   /^阅读\\s*\\d+/.test(text) ||
-                  /^查看\\s*\\d+/.test(text) ||
                   /^\\d+\\s*条回复/.test(text)
                 ) {
                   removeNode(node);
@@ -1869,12 +1866,21 @@ def _prepare_tweet_for_screenshot(tweet_card) -> None:
 
                 const aspect = sourceWidth / sourceHeight;
                 const targetWidth = Math.min(rect.height * aspect, rect.width);
+                const playerRoot =
+                  video.closest('[data-testid="videoComponent"]') ||
+                  video.closest('[data-testid="videoPlayer"]') ||
+                  video.parentElement;
+                if (!(playerRoot instanceof HTMLElement)) {
+                  return;
+                }
+
                 const chain = [];
                 let current = video;
-                while (current && current !== tweetRoot) {
+                while (current && current !== playerRoot) {
                   chain.push(current);
                   current = current.parentElement;
                 }
+                chain.push(playerRoot);
 
                 for (const node of chain) {
                   if (!(node instanceof HTMLElement)) {
@@ -1895,6 +1901,55 @@ def _prepare_tweet_for_screenshot(tweet_card) -> None:
                 video.style.background = 'transparent';
               };
 
+              const stabilizeFooterLayout = () => {
+                for (const row of tweetRoot.querySelectorAll('[role="group"]')) {
+                  if (!(row instanceof HTMLElement)) {
+                    continue;
+                  }
+                  const rect = row.getBoundingClientRect();
+                  if (rect.width < 80 || rect.height > 96) {
+                    continue;
+                  }
+                  row.style.width = '100%';
+                  row.style.maxWidth = '100%';
+                  row.style.minWidth = '0';
+                  row.style.flex = '1 1 auto';
+                }
+
+                for (const row of tweetRoot.querySelectorAll('div')) {
+                  if (!(row instanceof HTMLElement)) {
+                    continue;
+                  }
+                  const text = (row.innerText || '').trim();
+                  if (!/(views|查看|次观看)/i.test(text)) {
+                    continue;
+                  }
+                  if (!/(\\d{1,2}:\\d{2}|年|AM|PM|·)/i.test(text)) {
+                    continue;
+                  }
+                  const rect = row.getBoundingClientRect();
+                  if (rect.height > 60 || rect.width < 120) {
+                    continue;
+                  }
+                  row.style.width = '100%';
+                  row.style.maxWidth = '100%';
+
+                  for (const span of row.querySelectorAll('span')) {
+                    if (!(span instanceof HTMLElement)) {
+                      continue;
+                    }
+                    const label = (span.textContent || '').trim();
+                    if (/^(views|查看|次观看)$/i.test(label)) {
+                      span.style.display = 'inline';
+                      span.style.marginLeft = '0.25em';
+                    }
+                    if (/^[\\d,.]+万?$/.test(label)) {
+                      span.style.display = 'inline';
+                    }
+                  }
+                }
+              };
+
               for (const video of root.querySelectorAll('video')) {
                 if (!isVisible(video)) {
                   continue;
@@ -1902,6 +1957,8 @@ def _prepare_tweet_for_screenshot(tweet_card) -> None:
                 hideVideoControlChrome(video);
                 trimVideoContainer(video);
               }
+
+              stabilizeFooterLayout();
             }
             """
         )
@@ -2093,10 +2150,11 @@ def _compute_capture_clip(page, tweet_card):
             bottom = rootBottom;
           } else {
             top = Math.min(top, rootY);
-            left = Math.max(left, rootX);
-            right = Math.min(right, rootRight);
             bottom = Math.max(bottom, rootBottom);
           }
+
+          left = rootX;
+          right = rootRight;
 
           const padding = 12;
           const x = Math.max(0, Math.floor(left - padding));
