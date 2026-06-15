@@ -1226,6 +1226,30 @@ def _prepare_video_frames(
                 return null;
               };
 
+              const findVideoPlayerRoot = (video, cardRoot) => {
+                const explicit =
+                  video.closest('[data-testid="videoComponent"]') ||
+                  video.closest('[data-testid="videoPlayer"]');
+                if (explicit instanceof HTMLElement) {
+                  return explicit;
+                }
+
+                const videoRect = video.getBoundingClientRect();
+                let node = video.parentElement;
+                while (node instanceof HTMLElement && node !== cardRoot) {
+                  const rect = node.getBoundingClientRect();
+                  if (
+                    rect.width <= Math.max(videoRect.width * 1.8, videoRect.width + 96) &&
+                    rect.height <= Math.max(videoRect.height * 2.5, videoRect.height + 96)
+                  ) {
+                    return node;
+                  }
+                  node = node.parentElement;
+                }
+
+                return video.parentElement instanceof HTMLElement ? video.parentElement : video;
+              };
+
               const prepareOneVideo = async (video, targetSeconds, cardRoot) => {
               video.muted = true;
               video.defaultMuted = true;
@@ -1233,11 +1257,7 @@ def _prepare_video_frames(
               video.preload = 'auto';
               video.controls = false;
 
-              const playerRoot =
-                video.closest('[data-testid="videoComponent"]') ||
-                video.closest('[data-testid="videoPlayer"]') ||
-                video.parentElement ||
-                cardRoot;
+              const playerRoot = findVideoPlayerRoot(video, cardRoot);
 
               const activatePlayer = () => {
                 const candidates = [
@@ -1343,12 +1363,15 @@ def _prepare_video_frames(
                 video.controls = false;
 
                 const root = playerRoot instanceof HTMLElement ? playerRoot : video.parentElement;
-                if (!(root instanceof HTMLElement)) {
+                if (!(root instanceof HTMLElement) || root === cardRoot) {
+                  return;
+                }
+                if (/(views|查看|次观看)/i.test(root.innerText || '')) {
                   return;
                 }
 
                 root.querySelectorAll(
-                  'button,[role="button"],[role="progressbar"],[role="slider"],input[type="range"],svg,img,span',
+                  'button,[role="button"],[role="progressbar"],[role="slider"],input[type="range"],svg,img',
                 ).forEach((node) => {
                   if (!(node instanceof HTMLElement) || node === video || video.contains(node)) {
                     return;
@@ -1747,21 +1770,46 @@ def _prepare_tweet_for_screenshot(tweet_card) -> None:
                   if (entry.rect.width < 220 || entry.rect.height < 12) {
                     return false;
                   }
-                  const nearBottom = entry.rect.bottom >= rootRect.top + rootRect.height * 0.62;
-                  const looksLikeEngagement = /reply|repost|like|bookmark|share|回复|转推|喜欢|收藏|分享/i.test(
+                  if (
+                    entry.node.closest(
+                      '[data-testid="videoComponent"], [data-testid="videoPlayer"]',
+                    )
+                  ) {
+                    return false;
+                  }
+                  const hasEngagementButton = Boolean(
+                    entry.node.querySelector(
+                      '[data-testid="reply"], [data-testid="retweet"], [data-testid="like"], [data-testid="bookmark"], [data-testid="share"]',
+                    ),
+                  );
+                  const looksLikeEngagement = /reply|repost|retweet|like|bookmark|share|回复|转推|喜欢|收藏|分享/i.test(
                     entry.text,
                   );
-                  return nearBottom || looksLikeEngagement;
+                  return hasEngagementButton || looksLikeEngagement;
                 });
               const actionBar = actionGroups.sort(
                 (a, b) => b.rect.bottom - a.rect.bottom,
               )[0]?.node;
 
               if (actionBar) {
+                const containsFooterMetadata = (node) => {
+                  if (!(node instanceof HTMLElement)) {
+                    return false;
+                  }
+                  const text = (node.innerText || '').trim();
+                  return (
+                    /(views|查看|次观看)/i.test(text) &&
+                    /(\\d{1,2}:\\d{2}|年|AM|PM|·)/i.test(text)
+                  );
+                };
+
                 const removeFollowing = (container, pivot) => {
                   let seen = false;
                   for (const child of [...container.children]) {
                     if (seen) {
+                      if (containsFooterMetadata(child)) {
+                        continue;
+                      }
                       removeNode(child);
                       continue;
                     }
@@ -1803,17 +1851,41 @@ def _prepare_tweet_for_screenshot(tweet_card) -> None:
               }
 
               const hideVideoControlChrome = (video) => {
-                const playerRoot =
-                  video.closest('[data-testid="videoComponent"]') ||
-                  video.closest('[data-testid="videoPlayer"]') ||
-                  video.parentElement;
-                if (!(playerRoot instanceof HTMLElement)) {
+                const findVideoPlayerRoot = (videoNode, cardRoot) => {
+                  const explicit =
+                    videoNode.closest('[data-testid="videoComponent"]') ||
+                    videoNode.closest('[data-testid="videoPlayer"]');
+                  if (explicit instanceof HTMLElement) {
+                    return explicit;
+                  }
+
+                  const videoRect = videoNode.getBoundingClientRect();
+                  let node = videoNode.parentElement;
+                  while (node instanceof HTMLElement && node !== cardRoot) {
+                    const rect = node.getBoundingClientRect();
+                    if (
+                      rect.width <= Math.max(videoRect.width * 1.8, videoRect.width + 96) &&
+                      rect.height <= Math.max(videoRect.height * 2.5, videoRect.height + 96)
+                    ) {
+                      return node;
+                    }
+                    node = node.parentElement;
+                  }
+
+                  return videoNode.parentElement instanceof HTMLElement ? videoNode.parentElement : videoNode;
+                };
+
+                const playerRoot = findVideoPlayerRoot(video, tweetRoot);
+                if (!(playerRoot instanceof HTMLElement) || playerRoot === tweetRoot) {
+                  return;
+                }
+                if (/(views|查看|次观看)/i.test(playerRoot.innerText || '')) {
                   return;
                 }
 
                 video.controls = false;
                 playerRoot.querySelectorAll(
-                  'button,[role="button"],[role="progressbar"],[role="slider"],input[type="range"],svg,img,span',
+                  'button,[role="button"],[role="progressbar"],[role="slider"],input[type="range"],svg,img',
                 ).forEach((node) => {
                   if (!(node instanceof HTMLElement) || node === video || video.contains(node)) {
                     return;
