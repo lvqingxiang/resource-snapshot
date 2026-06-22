@@ -1739,9 +1739,9 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                       grid.style.gridTemplateRows = '1fr';
                       grid.style.aspectRatio = '16 / 9';
                     } else if (videoSlides.length === 3) {
-                      grid.style.gridTemplateColumns = '1.2fr 0.8fr';
+                      grid.style.gridTemplateColumns = '3fr 2fr';
                       grid.style.gridTemplateRows = '1fr 1fr';
-                      grid.style.aspectRatio = '3 / 4';
+                      grid.style.aspectRatio = '16 / 10';
                     } else {
                       grid.style.gridTemplateColumns = '1fr 1fr';
                       grid.style.gridTemplateRows = '1fr 1fr';
@@ -1765,6 +1765,7 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                         clone.style.width = '100%';
                         clone.style.height = '100%';
                         clone.style.objectFit = 'cover';
+                        clone.style.objectPosition = 'top';
                         clone.style.display = 'block';
                         clone.muted = true;
                         clone.defaultMuted = true;
