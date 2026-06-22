@@ -118,7 +118,7 @@ article div[dir="auto"] {{
 
 article [data-testid="videoComponent"],
 article [data-testid="videoPlayer"] {{
-  width: fit-content !important;
+  width: 100% !important;
   max-width: 100% !important;
   margin-left: auto !important;
   margin-right: auto !important;
@@ -167,11 +167,13 @@ article[data-tweet-id] {{
   max-width: min(598px, calc(100vw - 32px)) !important;
   margin-left: auto !important;
   margin-right: auto !important;
+  overflow: hidden !important;
 }}
 
 main[role="main"] {{
   display: block !important;
   background: {background} !important;
+  overflow: hidden !important;
 }}
 
 [data-testid="primaryColumn"] {{
@@ -179,6 +181,7 @@ main[role="main"] {{
   max-width: none !important;
   margin: 0 auto !important;
   background: {background} !important;
+  overflow: hidden !important;
 }}
 
 article[data-testid="tweet"],
@@ -415,6 +418,12 @@ def _hide_non_primary_columns(page) -> None:
                 }
               };
 
+              const hideNode = (node) => {
+                if (node instanceof HTMLElement) {
+                  node.style.display = 'none';
+                }
+              };
+
               const selectors = [
                 '[data-testid="sidebarColumn"]',
                 '[data-testid="secondaryColumn"]',
@@ -448,6 +457,44 @@ def _hide_non_primary_columns(page) -> None:
                     }
                   }
                 }
+              }
+
+              // Hide adjacent tweet cells so they don't peek into the screenshot
+              const targetArticle = document.querySelector(
+                'article[data-tweet-id], article[data-testid="tweet"]'
+              );
+              if (targetArticle) {
+                const targetCell = targetArticle.closest('[data-testid="cellInnerDiv"]');
+                if (targetCell?.parentElement) {
+                  for (const sibling of [...targetCell.parentElement.children]) {
+                    if (sibling !== targetCell && sibling instanceof HTMLElement) {
+                      hideNode(sibling);
+                    }
+                  }
+                }
+
+                // Also hide siblings of any ancestor cell wrapper
+                let current = targetCell;
+                while (current?.parentElement) {
+                  const parent = current.parentElement;
+                  if (parent === main || parent === primary || parent === document.body) break;
+                  for (const sibling of [...parent.children]) {
+                    if (sibling !== current && sibling instanceof HTMLElement) {
+                      hideNode(sibling);
+                    }
+                  }
+                  current = parent;
+                }
+              }
+
+              // Hide any remaining peek / suggestion elements
+              const peekSelectors = [
+                '[data-testid="tweet-detail-more-replies"]',
+                '[data-testid="conversation-more-replies"]',
+                '[data-testid="related-tweets"]',
+              ];
+              for (const sel of peekSelectors) {
+                document.querySelectorAll(sel).forEach(hideNode);
               }
             }
             """
@@ -1593,6 +1640,52 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
 
               root.querySelectorAll(`[${GRID_ATTR}]`).forEach(removeNode);
 
+              // Detect and fix multi-cam video layouts (multiple simultaneous video panels)
+              const allVideos = [...root.querySelectorAll('video')];
+              if (allVideos.length > 1) {
+                // Find the common ancestor container that holds all video panels
+                const videoContainers = new Map();
+                for (const video of allVideos) {
+                  let parent = video.parentElement;
+                  while (parent && parent !== root) {
+                    const videos = parent.querySelectorAll('video');
+                    if (videos.length > 1) {
+                      const key = parent;
+                      if (!videoContainers.has(key)) {
+                        videoContainers.set(key, videos.length);
+                      }
+                      break;
+                    }
+                    parent = parent.parentElement;
+                  }
+                }
+
+                // Find the innermost container with multiple videos
+                let multiCamContainer = null;
+                let minVideoCount = Infinity;
+                for (const [container, count] of videoContainers) {
+                  if (count > 1 && count < minVideoCount) {
+                    multiCamContainer = container;
+                    minVideoCount = count;
+                  }
+                }
+
+                if (multiCamContainer instanceof HTMLElement) {
+                  // Ensure the multi-cam container fits within the article
+                  multiCamContainer.style.overflow = 'hidden';
+                  multiCamContainer.style.width = '100%';
+                  multiCamContainer.style.maxWidth = '100%';
+
+                  // Also ensure all ancestor containers don't overflow
+                  let ancestor = multiCamContainer.parentElement;
+                  while (ancestor instanceof HTMLElement && ancestor !== root) {
+                    ancestor.style.overflow = 'hidden';
+                    ancestor.style.maxWidth = '100%';
+                    ancestor = ancestor.parentElement;
+                  }
+                }
+              }
+
               const carousels = [...root.querySelectorAll('div')].filter((node) => {
                 if (!(node instanceof HTMLElement)) {
                   return false;
@@ -1628,6 +1721,80 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                   .filter((img) => isMediaImage(img));
 
                 if (images.length === 0) {
+                  // Handle video carousels
+                  const videoSlides = [...carousel.children].filter(
+                    (child) => child.querySelector('video') || child.querySelector('[data-testid="videoComponent"]')
+                  );
+                  if (videoSlides.length > 1) {
+                    // Multi-cam: convert horizontal carousel to grid layout
+                    const grid = document.createElement('div');
+                    grid.style.display = 'grid';
+                    grid.style.width = '100%';
+                    grid.style.gap = '2px';
+                    grid.style.borderRadius = '16px';
+                    grid.style.overflow = 'hidden';
+                    grid.style.background = '#000';
+                    if (videoSlides.length === 2) {
+                      grid.style.gridTemplateColumns = '1fr 1fr';
+                      grid.style.gridTemplateRows = '1fr';
+                      grid.style.aspectRatio = '16 / 9';
+                    } else if (videoSlides.length === 3) {
+                      grid.style.gridTemplateColumns = '1.2fr 0.8fr';
+                      grid.style.gridTemplateRows = '1fr 1fr';
+                      grid.style.aspectRatio = '3 / 4';
+                    } else {
+                      grid.style.gridTemplateColumns = '1fr 1fr';
+                      grid.style.gridTemplateRows = '1fr 1fr';
+                      grid.style.aspectRatio = '1 / 1';
+                    }
+                    for (let i = 0; i < Math.min(videoSlides.length, 4); i++) {
+                      const cell = document.createElement('div');
+                      cell.style.position = 'relative';
+                      cell.style.overflow = 'hidden';
+                      cell.style.minWidth = '0';
+                      cell.style.minHeight = '0';
+                      cell.style.width = '100%';
+                      cell.style.height = '100%';
+                      cell.style.background = '#000';
+                      const slide = videoSlides[i];
+                      const video = slide.querySelector('video');
+                      if (video) {
+                        const clone = video.cloneNode(true);
+                        clone.removeAttribute('style');
+                        clone.className = '';
+                        clone.style.width = '100%';
+                        clone.style.height = '100%';
+                        clone.style.objectFit = 'cover';
+                        clone.style.display = 'block';
+                        clone.muted = true;
+                        clone.defaultMuted = true;
+                        clone.playsInline = true;
+                        clone.controls = false;
+                        clone.autoplay = false;
+                        clone.currentTime = video.currentTime || 0;
+                        cell.appendChild(clone);
+                      } else {
+                        const inner = slide.cloneNode(true);
+                        inner.style.width = '100%';
+                        inner.style.height = '100%';
+                        cell.appendChild(inner);
+                      }
+                      if (videoSlides.length === 3 && i === 0) {
+                        cell.style.gridRow = '1 / span 2';
+                      }
+                      grid.appendChild(cell);
+                    }
+                    carousel.replaceWith(grid);
+                  } else if (videoSlides.length === 1) {
+                    carousel.style.display = 'block';
+                    carousel.style.overflow = 'hidden';
+                    carousel.style.width = '100%';
+                    carousel.style.borderRadius = '16px';
+                    const slide = videoSlides[0];
+                    slide.style.width = '100%';
+                    slide.style.maxWidth = '100%';
+                    slide.style.flexShrink = '0';
+                  }
                   continue;
                 }
 
