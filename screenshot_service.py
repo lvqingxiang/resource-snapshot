@@ -2198,6 +2198,47 @@ def _prepare_tweet_for_screenshot(tweet_card) -> None:
                 trimVideoContainer(video);
               }
 
+              // Reformat timestamp links from UTC to Asia/Shanghai (UTC+8)
+              const reformatTimestamps = () => {
+                const CST_OFFSET_H = 8;
+                for (const el of root.querySelectorAll('a, time, span')) {
+                  const text = (el.textContent || '').trim();
+                  // Match pattern: "HH:MM · YYYY年M月D日" or "HH:MM AM/PM · YYYY年M月D日"
+                  const match = text.match(/^(\\d{1,2}):(\\d{2})\\s*(AM|PM)?\\s*[\\u00b7\\u2027\\u2219]\\s*(\\d{4})\\u5e74(\\d{1,2})\\u6708(\\d{1,2})\\u65e5$/i);
+                  if (!match) continue;
+
+                  let hours = parseInt(match[1], 10);
+                  const minutes = parseInt(match[2], 10);
+                  const ampm = (match[3] || '').toUpperCase();
+                  let year = parseInt(match[4], 10);
+                  let month = parseInt(match[5], 10);
+                  let day = parseInt(match[6], 10);
+
+                  // Convert to 24h if AM/PM
+                  if (ampm === 'PM' && hours < 12) hours += 12;
+                  if (ampm === 'AM' && hours === 12) hours = 0;
+
+                  // Build UTC date, then add CST offset
+                  const utcDate = new Date(Date.UTC(year, month - 1, day, hours, minutes));
+                  utcDate.setUTCHours(utcDate.getUTCHours() + CST_OFFSET_H);
+
+                  const newHours = utcDate.getUTCHours();
+                  const newMinutes = utcDate.getUTCMinutes();
+                  const newYear = utcDate.getUTCFullYear();
+                  const newMonth = utcDate.getUTCMonth() + 1;
+                  const newDay = utcDate.getUTCDate();
+
+                  const timeStr = String(newHours).padStart(2, '0') + ':' + String(newMinutes).padStart(2, '0');
+                  const dateStr = newYear + '\u5e74' + newMonth + '\u6708' + newDay + '\u65e5';
+                  const newText = timeStr + ' \u00b7 ' + dateStr;
+
+                  if (newText !== text) {
+                    el.textContent = newText;
+                  }
+                }
+              };
+              reformatTimestamps();
+
               stabilizeFooterLayout();
             }
             """
@@ -2504,6 +2545,14 @@ def _apply_chinese_locale(context) -> None:
               Object.defineProperty(navigator, 'language', { get: () => 'zh-CN' });
               Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US'] });
               document.documentElement.lang = 'zh-CN';
+
+              // Force Date.getTimezoneOffset to always return UTC+8 (-480 min)
+              // so any client-side date formatting uses China Standard Time
+              const CST_OFFSET = -480;
+              const originalGetTimezoneOffset = Date.prototype.getTimezoneOffset;
+              Date.prototype.getTimezoneOffset = function () {
+                return CST_OFFSET;
+              };
             }
             """
         )
