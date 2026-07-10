@@ -189,4 +189,4 @@ if __name__ == "__main__":
         timer.daemon = True
         timer.start()
 
-    app.run(host="127.0.0.1", port=PORT, debug=False, threaded=False, use_reloader=False)
+    app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True, use_reloader=False)

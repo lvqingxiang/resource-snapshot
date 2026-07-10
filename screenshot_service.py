@@ -671,6 +671,33 @@ def _fetch_translation_payload(url: str) -> object | None:
         return None
 
 
+def _dismiss_x_auto_translation(tweet_card) -> None:
+    """Dismiss X's built-in auto-translation by clicking '显示原文' / 'Show original' buttons.
+
+    When the browser locale is zh-CN, X automatically translates non-Chinese tweets
+    and replaces the original text in [data-testid="tweetText"] with the translation.
+    This function reverts to the original text so our own translation pipeline works correctly.
+    """
+    try:
+        show_original_btns = tweet_card.locator(
+            'button[aria-label="显示原文"], button[aria-label="Show original"]'
+        )
+        count = show_original_btns.count()
+        if count == 0:
+            return
+        for i in range(count):
+            try:
+                btn = show_original_btns.nth(i)
+                if btn.is_visible():
+                    btn.click(timeout=3000)
+            except Exception:
+                pass
+        # Wait for DOM to update after reverting translations
+        time.sleep(0.6)
+    except Exception:
+        pass
+
+
 _TEXT_ANCHOR_COLLECTION_JS = f"""
 (root) => {{
   const isVisible = (node) => {{
@@ -711,7 +738,13 @@ _TEXT_ANCHOR_COLLECTION_JS = f"""
   const anchors = [];
   const pushNode = (node) => {{
     const text = (node.innerText || '').trim();
-    if (!text || text.length < 8 || seen.has(text)) {{
+    if (!text || seen.has(text)) {{
+      return;
+    }}
+    // Accept tweet body text elements with low threshold.
+    // Non-body-text elements (usernames, buttons, etc.) are already excluded by isTweetBodyText.
+    const minLen = 4;
+    if (text.length < minLen) {{
       return;
     }}
     seen.add(text);
@@ -933,6 +966,7 @@ def _inject_chinese_translations(
     custom_translation: str | None = None,
     translation_overrides: dict[int, str] | None = None,
 ) -> int:
+    _dismiss_x_auto_translation(tweet_card)
     text_blocks = _extract_translatable_text_blocks(tweet_card)
     if not text_blocks:
         return 0
@@ -1003,9 +1037,11 @@ def _remove_native_translation_ui(tweet_card) -> None:
                 'Translate Tweet',
                 'Show translation',
                 '查看翻译',
+                '显示原文',
+                'Show original',
                 '重试',
               ]);
-              const blockTexts = ['无法获取翻译'];
+              const blockTexts = ['无法获取翻译', '翻译自', 'Translated from', '评价此翻译', 'Rate this translation'];
 
               const candidates = [
                 ...root.querySelectorAll('button, [role="button"], a, div, span'),
@@ -1025,6 +1061,13 @@ def _remove_native_translation_ui(tweet_card) -> None:
                   continue;
                 }
                 if (node.hasAttribute('data-testid') && node.getAttribute('data-testid') === 'tweetText') {
+                  continue;
+                }
+
+                // Remove the entire translation bar container when we match '翻译自' / 'Translated from'
+                if (matchesBlock && (text.includes('翻译自') || text.includes('Translated from'))) {
+                  const bar = node.closest('.css-175oi2r.r-1s2bzr4') || node.closest('.css-175oi2r') || node;
+                  bar.remove();
                   continue;
                 }
 
@@ -2710,6 +2753,7 @@ def preview_tweet_translations(
             )
             _wait_for_tweet_assets(page, tweet_card)
 
+            _dismiss_x_auto_translation(tweet_card)
             text_blocks = _extract_translatable_text_blocks(tweet_card)
             items = tuple(
                 TranslationPreviewItem(
