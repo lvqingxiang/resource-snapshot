@@ -741,6 +741,10 @@ _TEXT_ANCHOR_COLLECTION_JS = f"""
     if (!text || seen.has(text)) {{
       return;
     }}
+    // Skip text that contains no letters (only numbers, punctuation, whitespace)
+    if (!/\p{{L}}/u.test(text)) {{
+      return;
+    }}
     // Accept tweet body text elements with low threshold.
     // Non-body-text elements (usernames, buttons, etc.) are already excluded by isTweetBodyText.
     const minLen = 4;
