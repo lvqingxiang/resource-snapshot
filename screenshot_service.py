@@ -642,6 +642,39 @@ def _wait_for_tweet_assets(page, tweet_card) -> None:
     page.wait_for_timeout(1200)
 
 
+# Regex: Hiragana, Katakana, Hangul (Japanese/Korean scripts)
+_NON_CHINESE_SCRIPT_RE = re.compile(
+    "[\u3040-\u309F"  # Hiragana
+    "\u30A0-\u30FF"   # Katakana
+    "\uAC00-\uD7AF"   # Hangul Syllables
+    "\u1100-\u11FF"   # Hangul Jamo
+    "\u3130-\u318F"   # Hangul Compatibility Jamo
+    "]"
+)
+_CHINESE_CHAR_RE = re.compile("[\u4e00-\u9fff\u3400-\u4dbf]")
+# Latin letters including common Western European accents (Spanish, French, etc.)
+_LATIN_LETTER_RE = re.compile("[A-Za-z\u00c0-\u024f\u1e00-\u1eff]")
+
+
+def _text_looks_non_chinese(text: str) -> bool:
+    """True when text still looks like a foreign-language source, not Chinese.
+
+    X may mark auto-translated (or restored) tweet nodes as lang=zh even when the
+    visible body is Spanish/English/Japanese/etc. Only treat lang=zh as "skip
+    translation" when the text itself is predominantly Chinese.
+    """
+    normalized = (text or "").strip()
+    if not normalized:
+        return False
+    if _NON_CHINESE_SCRIPT_RE.search(normalized):
+        return True
+
+    chinese_count = len(_CHINESE_CHAR_RE.findall(normalized))
+    latin_count = len(_LATIN_LETTER_RE.findall(normalized))
+    # Enough Latin letters and not dominated by Chinese → needs translation.
+    return latin_count >= 4 and latin_count > chinese_count
+
+
 def _normalize_translation_lang(lang: str | None) -> str | None:
     value = (lang or "").strip()
     if not value:
@@ -679,21 +712,64 @@ def _dismiss_x_auto_translation(tweet_card) -> None:
     This function reverts to the original text so our own translation pipeline works correctly.
     """
     try:
-        show_original_btns = tweet_card.locator(
-            'button[aria-label="显示原文"], button[aria-label="Show original"]'
+        clicked = tweet_card.evaluate(
+            """
+            (root) => {
+              const labels = [
+                '显示原文',
+                '顯示原文',
+                'Show original',
+                'Ver original',
+                '原文を表示',
+                '원문 보기',
+              ];
+              let clicked = 0;
+              const candidates = root.querySelectorAll('button, div[role="button"], span[role="button"]');
+              for (const node of candidates) {
+                const label = (
+                  node.getAttribute('aria-label')
+                  || node.textContent
+                  || ''
+                ).trim();
+                if (!labels.some((item) => label === item || label.includes(item))) {
+                  continue;
+                }
+                try {
+                  node.click();
+                  clicked += 1;
+                } catch (error) {
+                  // ignore
+                }
+              }
+              return clicked;
+            }
+            """
         )
-        count = show_original_btns.count()
-        if count == 0:
-            return
-        for i in range(count):
-            try:
-                btn = show_original_btns.nth(i)
-                if btn.is_visible():
-                    btn.click(timeout=3000)
-            except Exception:
-                pass
-        # Wait for DOM to update after reverting translations
-        time.sleep(0.6)
+        if clicked:
+            # Wait for DOM to update after reverting translations
+            time.sleep(0.6)
+
+        # Keep captured originals in sync with the restored DOM text/lang.
+        # Otherwise a stale Chinese snapshot taken before "Show original" would
+        # override the real Spanish/English/etc. body during extraction.
+        tweet_card.evaluate(
+            """
+            (root) => {
+              for (const el of root.querySelectorAll('[data-testid="tweetText"]')) {
+                const text = (el.innerText || '').trim();
+                if (text) {
+                  el.setAttribute('data-rs-original-text', text);
+                }
+                const lang = el.getAttribute('lang');
+                if (lang) {
+                  el.setAttribute('data-rs-original-lang', lang);
+                } else {
+                  el.removeAttribute('data-rs-original-lang');
+                }
+              }
+            }
+            """
+        )
     except Exception:
         pass
 
@@ -780,11 +856,48 @@ def _extract_translatable_text_blocks(tweet_card) -> list[dict[str, str | int | 
             (root) => {{
               const collectAnchors = {_TEXT_ANCHOR_COLLECTION_JS};
               const anchors = collectAnchors(root);
-              return anchors.map((node, index) => ({{
-                index,
-                text: (node.innerText || '').trim(),
-                lang: node.getAttribute('lang') || node.querySelector('[lang]')?.getAttribute('lang') || '',
-              }}));
+              const looksMostlyChinese = (value) => {{
+                const text = (value || '').trim();
+                if (!text) {{
+                  return false;
+                }}
+                if (/[\\u3040-\\u30ff\\uac00-\\ud7af\\u1100-\\u11ff\\u3130-\\u318f]/.test(text)) {{
+                  return false;
+                }}
+                const chinese = (text.match(/[\\u4e00-\\u9fff\\u3400-\\u4dbf]/g) || []).length;
+                const latin = (text.match(/[A-Za-z\\u00c0-\\u024f]/g) || []).length;
+                return chinese > 0 && chinese >= latin;
+              }};
+
+              return anchors.map((node, index) => {{
+                // Prefer the original text captured by MutationObserver before X auto-translated it,
+                // but if "Show original" restored a non-Chinese body, trust the live DOM instead.
+                const origText = (node.getAttribute('data-rs-original-text') || '').trim();
+                const liveText = (node.innerText || '').trim();
+                let text = liveText || origText;
+                if (origText && liveText && origText !== liveText) {{
+                  if (looksMostlyChinese(liveText) && !looksMostlyChinese(origText)) {{
+                    text = origText;
+                  }} else if (!looksMostlyChinese(liveText) && looksMostlyChinese(origText)) {{
+                    text = liveText;
+                  }} else {{
+                    text = liveText;
+                  }}
+                }}
+                const origLang = node.getAttribute('data-rs-original-lang');
+                const liveLang = node.getAttribute('lang')
+                  || node.querySelector('[lang]')?.getAttribute('lang')
+                  || '';
+                // If we chose non-Chinese live text over a Chinese snapshot, drop a stale zh lang tag.
+                let lang = origLang || liveLang || '';
+                if (text === liveText && liveLang) {{
+                  lang = liveLang;
+                }}
+                if (text === liveText && looksMostlyChinese(origText) && !looksMostlyChinese(liveText)) {{
+                  lang = liveLang || '';
+                }}
+                return {{ index, text, lang }};
+              }});
             }}
             """
         )
@@ -942,11 +1055,15 @@ def _build_translation_items(
         elif index < len(custom_translation_blocks):
             translation = custom_translation_blocks[index]
         else:
-            if lang and lang.startswith("zh"):
+            # X may tag restored Spanish/English/ja/ko bodies as lang=zh after auto-translate.
+            # Skip only when the text itself is predominantly Chinese.
+            if lang and lang.startswith("zh") and not _text_looks_non_chinese(text):
                 continue
-            cache_key = (text, lang or "auto")
+            # When lang is wrongly zh but body is foreign, force auto language detection.
+            effective_lang = "auto" if (lang and lang.startswith("zh") and _text_looks_non_chinese(text)) else (lang or "auto")
+            cache_key = (text, effective_lang)
             if cache_key not in cache:
-                cache[cache_key] = _translate_text_to_chinese(text, lang)
+                cache[cache_key] = _translate_text_to_chinese(text, effective_lang if effective_lang != "auto" else None)
             translation = cache[cache_key]
 
         if not translation:
@@ -2585,6 +2702,15 @@ def _configure_page(page, *, dark_mode: bool, wait_timeout_ms: int) -> None:
 
 
 def _apply_chinese_locale(context) -> None:
+    """Apply Chinese locale overrides for UI formatting and CST timezone.
+
+    NOTE: We intentionally do NOT set the X ``lang`` cookie to zh-cn.
+    The lang cookie is what triggers X's server-side auto-translation of
+    non-Chinese tweets (ja, ko, …) into Chinese, which replaces the original
+    text in the DOM and breaks our translation pipeline.
+    All other zh-CN signals (navigator.language, documentElement.lang, Playwright
+    locale, Accept-Language) are kept for proper Chinese number/date formatting.
+    """
     try:
         context.add_init_script(
             """
@@ -2600,14 +2726,45 @@ def _apply_chinese_locale(context) -> None:
               Date.prototype.getTimezoneOffset = function () {
                 return CST_OFFSET;
               };
+
+              // Safety net: capture original tweet text as soon as tweetText elements
+              // appear in the DOM, before any client-side scripts can modify them.
+              const ATTR_ORIG_TEXT = 'data-rs-original-text';
+              const ATTR_ORIG_LANG = 'data-rs-original-lang';
+              const processed = new WeakSet();
+
+              const saveOriginal = (el) => {
+                if (processed.has(el)) return;
+                processed.add(el);
+                const text = (el.innerText || '').trim();
+                if (text) el.setAttribute(ATTR_ORIG_TEXT, text);
+                const lang = el.getAttribute('lang');
+                if (lang) el.setAttribute(ATTR_ORIG_LANG, lang);
+              };
+
+              const scan = () => {
+                document.querySelectorAll('[data-testid="tweetText"]').forEach(saveOriginal);
+              };
+
+              new MutationObserver((mutations) => {
+                for (const m of mutations) {
+                  for (const node of m.addedNodes) {
+                    if (node.nodeType === 1) {
+                      if (node.matches && node.matches('[data-testid="tweetText"]')) {
+                        saveOriginal(node);
+                      }
+                      if (node.querySelectorAll) {
+                        node.querySelectorAll('[data-testid="tweetText"]').forEach(saveOriginal);
+                      }
+                    }
+                  }
+                }
+              }).observe(document.documentElement, { childList: true, subtree: true });
+
+              if (document.readyState !== 'loading') scan();
+              else document.addEventListener('DOMContentLoaded', scan);
             }
             """
-        )
-        context.add_cookies(
-            [
-                {"name": "lang", "value": "zh-cn", "domain": ".x.com", "path": "/"},
-                {"name": "lang", "value": "zh-cn", "domain": ".twitter.com", "path": "/"},
-            ]
         )
     except Exception:
         pass
