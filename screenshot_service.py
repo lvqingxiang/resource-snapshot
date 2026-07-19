@@ -24,6 +24,7 @@ TWEET_URL_RE = re.compile(
 )
 GOOGLE_TRANSLATE_API_URL = "https://translate.googleapis.com/translate_a/single"
 MYMEMORY_TRANSLATE_API_URL = "https://api.mymemory.translated.net/get"
+TWITTER_OEMBED_API_URL = "https://publish.twitter.com/oembed"
 TRANSLATION_ATTR = "data-resource-snapshot-translation"
 DEFAULT_VIEWPORT_WIDTH = 1280
 DEFAULT_VIEWPORT_HEIGHT = 1800
@@ -675,6 +676,31 @@ def _text_looks_non_chinese(text: str) -> bool:
     return latin_count >= 4 and latin_count > chinese_count
 
 
+def _text_looks_mostly_chinese(text: str) -> bool:
+    normalized = (text or "").strip()
+    if not normalized or _NON_CHINESE_SCRIPT_RE.search(normalized):
+        return False
+    chinese_count = len(_CHINESE_CHAR_RE.findall(normalized))
+    latin_count = len(_LATIN_LETTER_RE.findall(normalized))
+    return chinese_count > 0 and chinese_count >= latin_count
+
+
+_LOOKS_MOSTLY_CHINESE_JS = r"""
+(value) => {
+  const text = (value || '').trim();
+  if (!text) {
+    return false;
+  }
+  if (/[\u3040-\u30ff\uac00-\ud7af\u1100-\u11ff\u3130-\u318f]/.test(text)) {
+    return false;
+  }
+  const chinese = (text.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g) || []).length;
+  const latin = (text.match(/[A-Za-z\u00c0-\u024f]/g) || []).length;
+  return chinese > 0 && chinese >= latin;
+}
+"""
+
+
 def _normalize_translation_lang(lang: str | None) -> str | None:
     value = (lang or "").strip()
     if not value:
@@ -702,6 +728,95 @@ def _fetch_translation_payload(url: str) -> object | None:
             return json.load(response)
     except Exception:
         return None
+
+
+def _fetch_oembed_tweet_body(status_url: str) -> tuple[str | None, str | None]:
+    """Return (original_text, lang) from Twitter oEmbed, bypassing X page auto-translate."""
+    normalized = (status_url or "").strip()
+    if not normalized:
+        return None, None
+
+    query = urlencode({"url": normalized, "omit_script": "1"})
+    payload = _fetch_translation_payload(f"{TWITTER_OEMBED_API_URL}?{query}")
+    if not isinstance(payload, dict):
+        return None, None
+
+    html = str(payload.get("html") or "")
+    match = re.search(
+        r'<p\b([^>]*)>(.*?)</p>',
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return None, None
+
+    attr_blob = match.group(1) or ""
+    lang_match = re.search(r'\blang=["\']([^"\']+)["\']', attr_blob, flags=re.IGNORECASE)
+    lang = _normalize_translation_lang(lang_match.group(1) if lang_match else None)
+
+    inner = match.group(2) or ""
+    text = unescape(re.sub(r"<[^>]+>", "", inner))
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s*https?://t\.co/\w+\s*$", "", text).strip()
+    text = re.sub(r"\s*pic\.twitter\.com/\w+\s*$", "", text, flags=re.IGNORECASE).strip()
+    if not text:
+        return None, None
+    return text, lang
+
+
+def _seed_original_text_from_oembed(tweet_card, original_text: str, lang: str | None) -> None:
+    """Attach oEmbed original text and restore visible body when X left a Chinese translation."""
+    try:
+        tweet_card.evaluate(
+            f"""
+            (root, payload) => {{
+              const looksMostlyChinese = {_LOOKS_MOSTLY_CHINESE_JS};
+              const text = (payload.text || '').trim();
+              const lang = (payload.lang || '').trim();
+              if (!text) {{
+                return;
+              }}
+              for (const el of root.querySelectorAll('[data-testid="tweetText"]')) {{
+                const live = (el.innerText || '').trim();
+                const existing = (el.getAttribute('data-rs-original-text') || '').trim();
+                if (!existing || (looksMostlyChinese(existing) && !looksMostlyChinese(text))) {{
+                  el.setAttribute('data-rs-original-text', text);
+                }}
+                if (lang) {{
+                  el.setAttribute('data-rs-original-lang', lang);
+                }}
+                // Restore source-language body so screenshots keep the original tweet text.
+                if (live && live !== text && looksMostlyChinese(live) && !looksMostlyChinese(text)) {{
+                  el.textContent = text;
+                  if (lang) {{
+                    el.setAttribute('lang', lang);
+                  }}
+                }}
+              }}
+            }}
+            """,
+            {"text": original_text, "lang": lang or ""},
+        )
+    except Exception:
+        pass
+
+
+def _collect_translation_text_blocks(tweet_card, status_url: str | None = None) -> list[dict[str, str | int | None]]:
+    """Extract tweet bodies for translation, with oEmbed fallback when X auto-translated to Chinese."""
+    _dismiss_x_auto_translation(tweet_card)
+    text_blocks = _extract_translatable_text_blocks(tweet_card)
+    if any(_text_looks_non_chinese(str(block.get("text") or "")) for block in text_blocks):
+        return text_blocks
+
+    oembed_text, oembed_lang = _fetch_oembed_tweet_body(status_url or "")
+    if not oembed_text or not _text_looks_non_chinese(oembed_text):
+        return text_blocks
+
+    _seed_original_text_from_oembed(tweet_card, oembed_text, oembed_lang)
+    text_blocks = _extract_translatable_text_blocks(tweet_card)
+    if any(_text_looks_non_chinese(str(block.get("text") or "")) for block in text_blocks):
+        return text_blocks
+    return [{"index": 0, "text": oembed_text, "lang": oembed_lang or ""}]
 
 
 def _dismiss_x_auto_translation(tweet_card) -> None:
@@ -749,25 +864,30 @@ def _dismiss_x_auto_translation(tweet_card) -> None:
             # Wait for DOM to update after reverting translations
             time.sleep(0.6)
 
-        # Keep captured originals in sync with the restored DOM text/lang.
-        # Otherwise a stale Chinese snapshot taken before "Show original" would
-        # override the real Spanish/English/etc. body during extraction.
+        # Sync captured originals with restored DOM text — but never replace a
+        # foreign-language snapshot with a Chinese auto-translation still on screen.
         tweet_card.evaluate(
-            """
-            (root) => {
-              for (const el of root.querySelectorAll('[data-testid="tweetText"]')) {
+            f"""
+            (root) => {{
+              const looksMostlyChinese = {_LOOKS_MOSTLY_CHINESE_JS};
+              for (const el of root.querySelectorAll('[data-testid="tweetText"]')) {{
                 const text = (el.innerText || '').trim();
-                if (text) {
-                  el.setAttribute('data-rs-original-text', text);
-                }
+                if (!text) {{
+                  continue;
+                }}
+                const existing = (el.getAttribute('data-rs-original-text') || '').trim();
+                if (existing && !looksMostlyChinese(existing) && looksMostlyChinese(text)) {{
+                  continue;
+                }}
+                el.setAttribute('data-rs-original-text', text);
                 const lang = el.getAttribute('lang');
-                if (lang) {
+                if (lang) {{
                   el.setAttribute('data-rs-original-lang', lang);
-                } else {
+                }} else if (!(existing && !looksMostlyChinese(existing))) {{
                   el.removeAttribute('data-rs-original-lang');
-                }
-              }
-            }
+                }}
+              }}
+            }}
             """
         )
     except Exception:
@@ -818,7 +938,7 @@ _TEXT_ANCHOR_COLLECTION_JS = f"""
       return;
     }}
     // Skip text that contains no letters (only numbers, punctuation, whitespace)
-    if (!/\p{{L}}/u.test(text)) {{
+    if (!/\\p{{L}}/u.test(text)) {{
       return;
     }}
     // Accept tweet body text elements with low threshold.
@@ -856,18 +976,7 @@ def _extract_translatable_text_blocks(tweet_card) -> list[dict[str, str | int | 
             (root) => {{
               const collectAnchors = {_TEXT_ANCHOR_COLLECTION_JS};
               const anchors = collectAnchors(root);
-              const looksMostlyChinese = (value) => {{
-                const text = (value || '').trim();
-                if (!text) {{
-                  return false;
-                }}
-                if (/[\\u3040-\\u30ff\\uac00-\\ud7af\\u1100-\\u11ff\\u3130-\\u318f]/.test(text)) {{
-                  return false;
-                }}
-                const chinese = (text.match(/[\\u4e00-\\u9fff\\u3400-\\u4dbf]/g) || []).length;
-                const latin = (text.match(/[A-Za-z\\u00c0-\\u024f]/g) || []).length;
-                return chinese > 0 && chinese >= latin;
-              }};
+              const looksMostlyChinese = {_LOOKS_MOSTLY_CHINESE_JS};
 
               return anchors.map((node, index) => {{
                 // Prefer the original text captured by MutationObserver before X auto-translated it,
@@ -895,6 +1004,9 @@ def _extract_translatable_text_blocks(tweet_card) -> list[dict[str, str | int | 
                 }}
                 if (text === liveText && looksMostlyChinese(origText) && !looksMostlyChinese(liveText)) {{
                   lang = liveLang || '';
+                }}
+                if (text === origText && origLang) {{
+                  lang = origLang;
                 }}
                 return {{ index, text, lang }};
               }});
@@ -1086,9 +1198,9 @@ def _inject_chinese_translations(
     tweet_card,
     custom_translation: str | None = None,
     translation_overrides: dict[int, str] | None = None,
+    status_url: str | None = None,
 ) -> int:
-    _dismiss_x_auto_translation(tweet_card)
-    text_blocks = _extract_translatable_text_blocks(tweet_card)
+    text_blocks = _collect_translation_text_blocks(tweet_card, status_url)
     if not text_blocks:
         return 0
 
@@ -2733,13 +2845,31 @@ def _apply_chinese_locale(context) -> None:
               const ATTR_ORIG_LANG = 'data-rs-original-lang';
               const processed = new WeakSet();
 
+              const looksMostlyChinese = (value) => {
+                const text = (value || '').trim();
+                if (!text) return false;
+                if (/[\u3040-\u30ff\uac00-\ud7af\u1100-\u11ff\u3130-\u318f]/.test(text)) return false;
+                const chinese = (text.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g) || []).length;
+                const latin = (text.match(/[A-Za-z\u00c0-\u024f]/g) || []).length;
+                return chinese > 0 && chinese >= latin;
+              };
+
               const saveOriginal = (el) => {
-                if (processed.has(el)) return;
-                processed.add(el);
                 const text = (el.innerText || '').trim();
-                if (text) el.setAttribute(ATTR_ORIG_TEXT, text);
+                if (!text) return;
+                const existing = (el.getAttribute(ATTR_ORIG_TEXT) || '').trim();
+                // Keep a foreign-language snapshot; allow upgrade from Chinese -> source language.
+                if (existing && !looksMostlyChinese(existing) && looksMostlyChinese(text)) {
+                  processed.add(el);
+                  return;
+                }
+                if (processed.has(el) && existing && !(looksMostlyChinese(existing) && !looksMostlyChinese(text))) {
+                  return;
+                }
+                el.setAttribute(ATTR_ORIG_TEXT, text);
                 const lang = el.getAttribute('lang');
                 if (lang) el.setAttribute(ATTR_ORIG_LANG, lang);
+                processed.add(el);
               };
 
               const scan = () => {
@@ -2914,8 +3044,7 @@ def preview_tweet_translations(
             )
             _wait_for_tweet_assets(page, tweet_card)
 
-            _dismiss_x_auto_translation(tweet_card)
-            text_blocks = _extract_translatable_text_blocks(tweet_card)
+            text_blocks = _collect_translation_text_blocks(tweet_card, used_url or normalized_url)
             items = tuple(
                 TranslationPreviewItem(
                     index=int(item["index"]),
@@ -3001,6 +3130,7 @@ def capture_tweet_page(
                     tweet_card,
                     custom_translation=custom_translation,
                     translation_overrides=translation_overrides,
+                    status_url=used_url or normalized_url,
                 )
                 _remove_native_translation_ui(tweet_card)
             _scroll_tweet_into_view(page, tweet_card, guest_mode=guest_mode)
