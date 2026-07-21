@@ -40,6 +40,122 @@ GUEST_PAGE_SETTLE_MS = 8000
 GUEST_POST_SCROLL_MS = 3000
 DEFAULT_LOCALE = "zh-CN"
 DEFAULT_TIMEZONE = "Asia/Shanghai"
+HLS_MASTER_ROUTE_RE = re.compile(
+    r"https://video\.twimg\.com/.*\.m3u8(?:\?.*)?$",
+    re.IGNORECASE,
+)
+
+
+def _prefer_highest_hls_variant(body: str) -> str:
+    """Rewrite an HLS master playlist to keep the highest-resolution stream."""
+    if "#EXT-X-STREAM-INF" not in body:
+        return body
+
+    lines = body.splitlines()
+    media_lines: list[str] = []
+    preamble: list[str] = []
+    streams: list[tuple[int, int, str, str, str | None]] = []
+    index = 0
+    saw_stream = False
+
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith("#EXT-X-MEDIA:"):
+            media_lines.append(line)
+            index += 1
+            continue
+        if line.startswith("#EXT-X-STREAM-INF:"):
+            saw_stream = True
+            info = line
+            uri = lines[index + 1] if index + 1 < len(lines) else ""
+            bandwidth = 0
+            area = 0
+            audio_group = None
+            match = re.search(r"BANDWIDTH=(\d+)", info)
+            if match:
+                bandwidth = int(match.group(1))
+            match = re.search(r"RESOLUTION=(\d+)x(\d+)", info)
+            if match:
+                area = int(match.group(1)) * int(match.group(2))
+            match = re.search(r'AUDIO="([^"]+)"', info)
+            if match:
+                audio_group = match.group(1)
+            streams.append((area, bandwidth, info, uri, audio_group))
+            index += 2
+            continue
+        if not saw_stream:
+            preamble.append(line)
+        index += 1
+
+    if not streams:
+        return body
+
+    _area, _bandwidth, info, uri, audio_group = max(
+        streams,
+        key=lambda item: (item[0], item[1]),
+    )
+    kept_media = [
+        line
+        for line in media_lines
+        if audio_group is None or f'GROUP-ID="{audio_group}"' in line
+    ]
+    return "\n".join([*preamble, *kept_media, info, uri]) + "\n"
+
+
+def _is_hls_media_playlist_url(url: str) -> bool:
+    lowered = url.lower()
+    return "/avc1/" in lowered or "/mp4a/" in lowered or "/hevc/" in lowered
+
+
+def _install_high_quality_hls_routes(context) -> None:
+    """Force X video players onto a high-quality HLS variant."""
+
+    def handle_route(route) -> None:
+        request = route.request
+        if _is_hls_media_playlist_url(request.url):
+            route.continue_()
+            return
+
+        try:
+            headers = {
+                "User-Agent": request.headers.get("user-agent") or GUEST_USER_AGENT,
+                "Accept": "*/*",
+                "Referer": "https://x.com/",
+                "Origin": "https://x.com",
+            }
+            accept_language = request.headers.get("accept-language")
+            if accept_language:
+                headers["Accept-Language"] = accept_language
+            fetch_request = Request(request.url, headers=headers)
+            with urlopen(fetch_request, timeout=20) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+                content_type = response.headers.get(
+                    "Content-Type",
+                    "application/vnd.apple.mpegurl",
+                )
+            if "#EXT-X-STREAM-INF" not in raw:
+                route.continue_()
+                return
+            body = _prefer_highest_hls_variant(raw)
+            route.fulfill(
+                status=200,
+                headers={
+                    "content-type": content_type,
+                    "access-control-allow-origin": "*",
+                    "cache-control": "no-store",
+                },
+                body=body,
+            )
+        except Exception:
+            try:
+                route.continue_()
+            except Exception:
+                pass
+
+    try:
+        context.route(HLS_MASTER_ROUTE_RE, handle_route)
+    except Exception:
+        pass
 
 
 def _translation_capture_css(dark_mode: bool) -> str:
@@ -714,6 +830,34 @@ def _normalize_translation_lang(lang: str | None) -> str | None:
     return lowered
 
 
+def _detect_translation_source_lang(text: str) -> str | None:
+    """Infer a source language when the tweet DOM does not expose lang=."""
+    sample = (text or "").strip()
+    if not sample:
+        return None
+
+    if re.search(r"[\u3040-\u30ff]", sample):
+        return "ja"
+    if re.search(r"[\uac00-\ud7af]", sample):
+        return "ko"
+    if re.search(r"[\u0400-\u04ff]", sample):
+        return "ru"
+    if re.search(r"[A-Za-z]", sample) and not re.search(r"[\u4e00-\u9fff]", sample):
+        return "en"
+    return None
+
+
+def _looks_like_chinese_text(text: str) -> bool:
+    sample = (text or "").strip()
+    if not sample:
+        return False
+    if re.search(r"[\u3040-\u30ff\uac00-\ud7af]", sample):
+        return False
+    han = len(re.findall(r"[\u4e00-\u9fff]", sample))
+    latin = len(re.findall(r"[A-Za-z]", sample))
+    return han > 0 and han >= latin
+
+
 def _fetch_translation_payload(url: str) -> object | None:
     request = Request(
         url,
@@ -1057,7 +1201,9 @@ def _translate_text_to_chinese_via_google(text: str, source_lang: str | None) ->
 
 def _translate_text_to_chinese_via_mymemory(text: str, source_lang: str | None) -> str | None:
     normalized_text = (text or "").strip()
-    normalized_lang = _normalize_translation_lang(source_lang)
+    normalized_lang = _normalize_translation_lang(source_lang) or _detect_translation_source_lang(
+        normalized_text
+    )
     if not normalized_text or not normalized_lang:
         return None
 
@@ -1082,6 +1228,8 @@ def _translate_text_to_chinese(text: str, source_lang: str | None) -> str | None
     normalized_lang = _normalize_translation_lang(source_lang)
     if not normalized_text or (normalized_lang and normalized_lang.startswith("zh")):
         return None
+    if not normalized_lang:
+        normalized_lang = _detect_translation_source_lang(normalized_text)
 
     translated = _translate_text_to_chinese_via_google(normalized_text, normalized_lang)
     if translated:
@@ -1171,16 +1319,28 @@ def _build_translation_items(
             # Skip only when the text itself is predominantly Chinese.
             if lang and lang.startswith("zh") and not _text_looks_non_chinese(text):
                 continue
+            if not lang and _looks_like_chinese_text(text):
+                continue
             # When lang is wrongly zh but body is foreign, force auto language detection.
-            effective_lang = "auto" if (lang and lang.startswith("zh") and _text_looks_non_chinese(text)) else (lang or "auto")
-            cache_key = (text, effective_lang)
+            if lang and lang.startswith("zh") and _text_looks_non_chinese(text):
+                effective_lang = "auto"
+            else:
+                effective_lang = lang or _detect_translation_source_lang(text)
+            cache_key = (text, effective_lang or "auto")
             if cache_key not in cache:
-                cache[cache_key] = _translate_text_to_chinese(text, effective_lang if effective_lang != "auto" else None)
+                cache[cache_key] = _translate_text_to_chinese(
+                    text,
+                    None if effective_lang in (None, "auto") else effective_lang,
+                )
             translation = cache[cache_key]
+            # Keep non-Chinese body text in the review UI even if providers fail,
+            # so the user can fill in a manual translation.
+            if not translation and effective_lang and not str(effective_lang).startswith("zh"):
+                translation = ""
 
-        if not translation:
+        if translation is None:
             continue
-        if translation.casefold() == text.casefold():
+        if translation and translation.casefold() == text.casefold():
             continue
 
         items.append(
@@ -1643,11 +1803,22 @@ def _prepare_video_frames(
 
               const warmUp = async () => {
                 try {
-                  await playFor(650);
+                  await playFor(1200);
                 } finally {
                   pauseVideo();
-                  await wait(140);
+                  await wait(180);
                 }
+              };
+
+              const waitForDecodedFrame = async (minWidth = 640, timeoutMs = 8000) => {
+                await waitUntil(
+                  () =>
+                    !video.error &&
+                    video.readyState >= 2 &&
+                    Number.isFinite(video.videoWidth) &&
+                    video.videoWidth >= minWidth,
+                  timeoutMs,
+                );
               };
 
               const clampTime = (value, duration) => {
@@ -1668,15 +1839,16 @@ def _prepare_video_frames(
                 try {
                   const seekPromise = Promise.race([
                     once(video, 'seeking', 1200),
-                    once(video, 'seeked', 3500),
-                    once(video, 'timeupdate', 3500),
+                    once(video, 'seeked', 5000),
+                    once(video, 'timeupdate', 5000),
                   ]);
                   video.currentTime = nextTime;
                   await seekPromise;
                   await waitUntil(
                     () => Math.abs((video.currentTime || 0) - nextTime) <= 0.18,
-                    1500,
+                    2500,
                   );
+                  await waitForDecodedFrame(Math.min(video.videoWidth || 640, 640), 5000);
                 } catch (error) {
                 }
                 return nextTime;
@@ -1736,9 +1908,9 @@ def _prepare_video_frames(
                   activatePlayer();
                   const playPromise = video.play();
                   if (playPromise && typeof playPromise.then === 'function') {
-                    await Promise.race([playPromise.catch(() => undefined), wait(250)]);
+                    await Promise.race([playPromise.catch(() => undefined), wait(400)]);
                   } else {
-                    await wait(180);
+                    await wait(250);
                   }
 
                   await waitUntil(
@@ -1746,24 +1918,29 @@ def _prepare_video_frames(
                       const current = video.currentTime || 0;
                       return current >= Math.max(desiredTime - 0.12, 0);
                     },
-                    1800,
+                    3500,
                   );
                 } catch (error) {
                 } finally {
                   pauseVideo();
-                  await wait(160);
+                  await wait(220);
                 }
 
                 if (Math.abs((video.currentTime || 0) - desiredTime) > 0.35) {
                   await seekTo(desiredTime, duration);
                   pauseVideo();
-                  await wait(120);
+                  await wait(180);
                 }
               };
 
               await ensureMetadata();
-              if (video.readyState < 2) {
+              // High-bitrate (1080p) HLS needs a real decode pass before seeking,
+              // otherwise Chromium often ends up with MEDIA_ERR_SRC_NOT_SUPPORTED.
+              await warmUp();
+              await waitForDecodedFrame(640, 8000);
+              if (video.readyState < 2 || video.videoWidth < 640) {
                 await warmUp();
+                await waitForDecodedFrame(640, 8000);
               }
 
               const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : null;
@@ -1782,7 +1959,7 @@ def _prepare_video_frames(
 
               desiredTime = clampTime(desiredTime, duration);
               await seekTo(desiredTime, duration);
-              if (video.readyState < 2) {
+              if (video.readyState < 2 || video.videoWidth < 640) {
                 await warmUp();
                 await seekTo(desiredTime, duration);
               }
@@ -1792,6 +1969,9 @@ def _prepare_video_frames(
                 await seekTo(desiredTime, duration);
                 await renderTargetFrame(desiredTime, duration);
               }
+
+              await waitForDecodedFrame(640, 6000);
+              await wait(280);
 
               hideVideoOverlays();
               await wait(160);
@@ -2926,6 +3106,7 @@ def _open_capture_session(
             },
         )
         _apply_chinese_locale(context)
+        _install_high_quality_hls_routes(context)
         page = context.new_page()
         _configure_page(page, dark_mode=dark_mode, wait_timeout_ms=wait_timeout_ms)
 
@@ -2950,6 +3131,7 @@ def _open_capture_session(
         },
     )
     _apply_chinese_locale(context)
+    _install_high_quality_hls_routes(context)
     page = context.pages[0] if context.pages else context.new_page()
     _configure_page(page, dark_mode=dark_mode, wait_timeout_ms=wait_timeout_ms)
 
