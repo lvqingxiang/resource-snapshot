@@ -44,17 +44,28 @@ HLS_MASTER_ROUTE_RE = re.compile(
     r"https://video\.twimg\.com/.*\.m3u8(?:\?.*)?$",
     re.IGNORECASE,
 )
+# Soft ceiling for headless Chromium: strip 4K / absurdly large amplify
+# streams (e.g. 2160x3840, avc1.640034) that often fail with
+# MEDIA_ELEMENT_ERROR: Format error. Keep multiple ~1080p-and-below
+# variants so ABR can prefer clearer frames and fall back if needed.
+HLS_MAX_EDGE_PX = 1920
+HLS_MAX_AREA_PX = 1920 * 1080
 
 
 def _prefer_highest_hls_variant(body: str) -> str:
-    """Rewrite an HLS master playlist to keep the highest-resolution stream."""
+    """Rewrite an HLS master to keep multiple under-cap variants for ABR.
+
+    Drops streams above the soft ceiling while retaining several rungs
+    (sorted highest-first) so the player can choose clearer frames when
+    decodable and fall back to lower ones on format/decode failure.
+    """
     if "#EXT-X-STREAM-INF" not in body:
         return body
 
     lines = body.splitlines()
     media_lines: list[str] = []
     preamble: list[str] = []
-    streams: list[tuple[int, int, str, str, str | None]] = []
+    streams: list[tuple[int, int, int, str, str, str | None]] = []
     index = 0
     saw_stream = False
 
@@ -70,17 +81,21 @@ def _prefer_highest_hls_variant(body: str) -> str:
             uri = lines[index + 1] if index + 1 < len(lines) else ""
             bandwidth = 0
             area = 0
+            max_edge = 0
             audio_group = None
             match = re.search(r"BANDWIDTH=(\d+)", info)
             if match:
                 bandwidth = int(match.group(1))
             match = re.search(r"RESOLUTION=(\d+)x(\d+)", info)
             if match:
-                area = int(match.group(1)) * int(match.group(2))
+                width = int(match.group(1))
+                height = int(match.group(2))
+                area = width * height
+                max_edge = max(width, height)
             match = re.search(r'AUDIO="([^"]+)"', info)
             if match:
                 audio_group = match.group(1)
-            streams.append((area, bandwidth, info, uri, audio_group))
+            streams.append((area, max_edge, bandwidth, info, uri, audio_group))
             index += 2
             continue
         if not saw_stream:
@@ -90,16 +105,36 @@ def _prefer_highest_hls_variant(body: str) -> str:
     if not streams:
         return body
 
-    _area, _bandwidth, info, uri, audio_group = max(
-        streams,
-        key=lambda item: (item[0], item[1]),
-    )
-    kept_media = [
-        line
-        for line in media_lines
-        if audio_group is None or f'GROUP-ID="{audio_group}"' in line
+    under_cap = [
+        item
+        for item in streams
+        if item[0] > 0
+        and item[1] <= HLS_MAX_EDGE_PX
+        and item[0] <= HLS_MAX_AREA_PX
     ]
-    return "\n".join([*preamble, *kept_media, info, uri]) + "\n"
+    # Prefer under-cap rungs; if none qualify, keep originals unchanged
+    # rather than inventing a single pinned URI.
+    candidates = under_cap or streams
+    candidates = sorted(
+        candidates,
+        key=lambda item: (item[0], item[2]),
+        reverse=True,
+    )
+    audio_groups = {item[5] for item in candidates if item[5]}
+    if audio_groups:
+        kept_media = [
+            line
+            for line in media_lines
+            if any(f'GROUP-ID="{group}"' in line for group in audio_groups)
+        ]
+    else:
+        kept_media = list(media_lines)
+
+    rewritten: list[str] = [*preamble, *kept_media]
+    for _area, _max_edge, _bandwidth, info, uri, _audio_group in candidates:
+        rewritten.append(info)
+        rewritten.append(uri)
+    return "\n".join(rewritten) + "\n"
 
 
 def _is_hls_media_playlist_url(url: str) -> bool:
@@ -108,7 +143,7 @@ def _is_hls_media_playlist_url(url: str) -> bool:
 
 
 def _install_high_quality_hls_routes(context) -> None:
-    """Force X video players onto a high-quality HLS variant."""
+    """Rewrite X HLS masters to under-cap multi-variant playlists for ABR."""
 
     def handle_route(route) -> None:
         request = route.request
@@ -234,11 +269,25 @@ article div[dir="auto"] {{
 }}
 
 article [data-testid="videoComponent"],
-article [data-testid="videoPlayer"] {{
+article [data-testid="videoPlayer"],
+article [data-testid="tweetPhoto"] {{
   width: 100% !important;
   max-width: 100% !important;
   margin-left: auto !important;
   margin-right: auto !important;
+  background: transparent !important;
+  min-width: 0 !important;
+}}
+
+/* Large srcset/orig images must not expand the article via flex min-content sizing.
+   Do NOT force width/height on <video> — X players use absolute fill inside an
+   aspect-ratio box and overriding that breaks decoding/layout. */
+article [data-testid="tweetPhoto"] img {{
+  display: block !important;
+  max-width: 100% !important;
+  width: 100% !important;
+  height: auto !important;
+  object-fit: contain !important;
   background: transparent !important;
 }}
 
@@ -1934,13 +1983,22 @@ def _prepare_video_frames(
               };
 
               await ensureMetadata();
-              // High-bitrate (1080p) HLS needs a real decode pass before seeking,
+              // High-bitrate HLS needs a real decode pass before seeking,
               // otherwise Chromium often ends up with MEDIA_ERR_SRC_NOT_SUPPORTED.
+              // Portrait clips may only be ~720px wide, so don't require 640+.
+              const minDecodeWidth = 360;
               await warmUp();
-              await waitForDecodedFrame(640, 8000);
-              if (video.readyState < 2 || video.videoWidth < 640) {
+              await waitForDecodedFrame(minDecodeWidth, 8000);
+              if (video.readyState < 2 || video.videoWidth < minDecodeWidth) {
                 await warmUp();
-                await waitForDecodedFrame(640, 8000);
+                await waitForDecodedFrame(minDecodeWidth, 8000);
+              }
+
+              // If 4K/unsupported streams still fail, leave the player alone —
+              // a later poster/thumbnail fallback can cover the screenshot.
+              if (video.error || video.readyState < 1 || video.videoWidth < 2) {
+                hideVideoOverlays();
+                return null;
               }
 
               const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : null;
@@ -1959,7 +2017,7 @@ def _prepare_video_frames(
 
               desiredTime = clampTime(desiredTime, duration);
               await seekTo(desiredTime, duration);
-              if (video.readyState < 2 || video.videoWidth < 640) {
+              if (video.readyState < 2 || video.videoWidth < minDecodeWidth) {
                 await warmUp();
                 await seekTo(desiredTime, duration);
               }
@@ -1970,7 +2028,7 @@ def _prepare_video_frames(
                 await renderTargetFrame(desiredTime, duration);
               }
 
-              await waitForDecodedFrame(640, 6000);
+              await waitForDecodedFrame(minDecodeWidth, 6000);
               await wait(280);
 
               hideVideoOverlays();
@@ -2315,10 +2373,47 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                 carousel.replaceWith(grid);
               }
 
-              const photoRoot = root.querySelector('[data-testid="tweetPhoto"]');
-              if (photoRoot instanceof HTMLElement) {
-                photoRoot.style.borderRadius = '16px';
-                photoRoot.style.overflow = 'hidden';
+              const constrainMediaTree = (mediaEl) => {
+                if (!(mediaEl instanceof HTMLElement)) {
+                  return;
+                }
+                mediaEl.style.setProperty('max-width', '100%', 'important');
+                mediaEl.style.setProperty('width', '100%', 'important');
+                mediaEl.style.setProperty('height', 'auto', 'important');
+                mediaEl.style.setProperty('object-fit', 'contain', 'important');
+                mediaEl.style.setProperty('display', 'block', 'important');
+
+                let node = mediaEl.parentElement;
+                while (node instanceof HTMLElement && node !== root) {
+                  node.style.minWidth = '0';
+                  node.style.maxWidth = '100%';
+                  node.style.overflow = 'hidden';
+                  if (node.getAttribute('data-testid') === 'tweetPhoto' ||
+                      node.getAttribute('data-testid') === 'videoComponent' ||
+                      node.getAttribute('data-testid') === 'videoPlayer') {
+                    node.style.width = '100%';
+                    node.style.borderRadius = '16px';
+                    break;
+                  }
+                  node = node.parentElement;
+                }
+              };
+
+              for (const img of root.querySelectorAll('img')) {
+                if (!isMediaImage(img)) {
+                  continue;
+                }
+                constrainMediaTree(img);
+              }
+
+              for (const photoRoot of root.querySelectorAll('[data-testid="tweetPhoto"]')) {
+                if (photoRoot instanceof HTMLElement) {
+                  photoRoot.style.borderRadius = '16px';
+                  photoRoot.style.overflow = 'hidden';
+                  photoRoot.style.maxWidth = '100%';
+                  photoRoot.style.width = '100%';
+                  photoRoot.style.minWidth = '0';
+                }
               }
             }
             """
@@ -2900,7 +2995,14 @@ def _compute_capture_clip(page, tweet_card):
           const contentBottom = actionBar ? Math.min(bottom, actionBar.bottom) : bottom;
           const maxBottom = Math.max(doc.scrollHeight, contentBottom + padding);
           const width = Math.max(1, Math.ceil(Math.min(maxRight, right + padding) - x));
-          const height = Math.max(1, Math.ceil(Math.min(maxBottom, contentBottom + padding) - y));
+          let height = Math.max(1, Math.ceil(Math.min(maxBottom, contentBottom + padding) - y));
+
+          // Guard against flex/min-content blowups from large orig/srcset images.
+          // A detail card with quote media should rarely exceed ~4x column width.
+          const maxHeight = Math.max(Math.ceil(rootRect.width * 4.5), 2400);
+          if (height > maxHeight) {
+            height = maxHeight;
+          }
 
           return { x, y, width, height };
         }
