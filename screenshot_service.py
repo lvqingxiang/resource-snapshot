@@ -45,22 +45,37 @@ HLS_MASTER_ROUTE_RE = re.compile(
     re.IGNORECASE,
 )
 # Soft ceiling for headless Chromium: strip 4K / absurdly large amplify
-# streams (e.g. 2160x3840, avc1.640034) that often fail with
-# MEDIA_ELEMENT_ERROR: Format error. Keep multiple ~1080p-and-below
-# variants so ABR can prefer clearer frames and fall back if needed.
+# streams (e.g. 2160x3840) that often fail with MEDIA_ELEMENT_ERROR.
+# Keep multiple ~1080p-and-below variants (not a single pinned URI) so
+# clearer frames are preferred when decodable. X's player may still hard-
+# fail on some 1080p profiles without ABR fallback — see demote steps.
 HLS_MAX_EDGE_PX = 1920
 HLS_MAX_AREA_PX = 1920 * 1080
+# Progressive ceilings used when the current playlist still won't decode.
+HLS_DEMOTE_STEPS: tuple[tuple[int, int], ...] = (
+    (1280, 1280 * 720),
+    (854, 854 * 480),
+    (640, 640 * 360),
+)
 
 
-def _prefer_highest_hls_variant(body: str) -> str:
+def _prefer_highest_hls_variant(
+    body: str,
+    *,
+    max_edge: int | None = None,
+    max_area: int | None = None,
+) -> str:
     """Rewrite an HLS master to keep multiple under-cap variants for ABR.
 
     Drops streams above the soft ceiling while retaining several rungs
-    (sorted highest-first) so the player can choose clearer frames when
-    decodable and fall back to lower ones on format/decode failure.
+    (sorted highest-first) so clearer frames are preferred when present.
+    Does not pin a single URI — lower rungs remain for player fallback.
     """
     if "#EXT-X-STREAM-INF" not in body:
         return body
+
+    edge_cap = HLS_MAX_EDGE_PX if max_edge is None else max_edge
+    area_cap = HLS_MAX_AREA_PX if max_area is None else max_area
 
     lines = body.splitlines()
     media_lines: list[str] = []
@@ -81,7 +96,7 @@ def _prefer_highest_hls_variant(body: str) -> str:
             uri = lines[index + 1] if index + 1 < len(lines) else ""
             bandwidth = 0
             area = 0
-            max_edge = 0
+            max_edge_px = 0
             audio_group = None
             match = re.search(r"BANDWIDTH=(\d+)", info)
             if match:
@@ -91,11 +106,11 @@ def _prefer_highest_hls_variant(body: str) -> str:
                 width = int(match.group(1))
                 height = int(match.group(2))
                 area = width * height
-                max_edge = max(width, height)
+                max_edge_px = max(width, height)
             match = re.search(r'AUDIO="([^"]+)"', info)
             if match:
                 audio_group = match.group(1)
-            streams.append((area, max_edge, bandwidth, info, uri, audio_group))
+            streams.append((area, max_edge_px, bandwidth, info, uri, audio_group))
             index += 2
             continue
         if not saw_stream:
@@ -108,9 +123,7 @@ def _prefer_highest_hls_variant(body: str) -> str:
     under_cap = [
         item
         for item in streams
-        if item[0] > 0
-        and item[1] <= HLS_MAX_EDGE_PX
-        and item[0] <= HLS_MAX_AREA_PX
+        if item[0] > 0 and item[1] <= edge_cap and item[0] <= area_cap
     ]
     # Prefer under-cap rungs; if none qualify, keep originals unchanged
     # rather than inventing a single pinned URI.
@@ -142,8 +155,49 @@ def _is_hls_media_playlist_url(url: str) -> bool:
     return "/avc1/" in lowered or "/mp4a/" in lowered or "/hevc/" in lowered
 
 
+def _demote_hls_quality_gate(context) -> bool:
+    """Lower the HLS soft ceiling after a decode failure. Returns True if lowered."""
+    gate = getattr(context, "_hls_quality_gate", None)
+    if not isinstance(gate, dict):
+        return False
+    current_edge = int(gate.get("max_edge") or HLS_MAX_EDGE_PX)
+    for edge, area in HLS_DEMOTE_STEPS:
+        if current_edge > edge:
+            gate["max_edge"] = edge
+            gate["max_area"] = area
+            return True
+    return False
+
+
+def _tweet_video_undecodable(tweet_card) -> bool:
+    """True when a visible tweet video failed to decode / show a frame."""
+    try:
+        return bool(
+            tweet_card.evaluate(
+                """(root) => {
+                  const video = root.querySelector('video');
+                  if (!(video instanceof HTMLVideoElement)) {
+                    return false;
+                  }
+                  const errText = (root.innerText || '').includes('could not be played');
+                  if (video.error || errText) {
+                    return true;
+                  }
+                  return video.readyState < 2 || video.videoWidth < 2;
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
 def _install_high_quality_hls_routes(context) -> None:
     """Rewrite X HLS masters to under-cap multi-variant playlists for ABR."""
+    gate = {"max_edge": HLS_MAX_EDGE_PX, "max_area": HLS_MAX_AREA_PX}
+    try:
+        setattr(context, "_hls_quality_gate", gate)
+    except Exception:
+        pass
 
     def handle_route(route) -> None:
         request = route.request
@@ -171,7 +225,11 @@ def _install_high_quality_hls_routes(context) -> None:
             if "#EXT-X-STREAM-INF" not in raw:
                 route.continue_()
                 return
-            body = _prefer_highest_hls_variant(raw)
+            body = _prefer_highest_hls_variant(
+                raw,
+                max_edge=int(gate.get("max_edge") or HLS_MAX_EDGE_PX),
+                max_area=int(gate.get("max_area") or HLS_MAX_AREA_PX),
+            )
             route.fulfill(
                 status=200,
                 headers={
@@ -3397,31 +3455,45 @@ def capture_tweet_page(
         page = session.page
 
         try:
-            tweet_card, used_url, capture_mode = _load_tweet_card(
-                page,
-                normalized_url,
-                screen_name,
-                tweet_id,
-                dark_mode=dark_mode,
-                wait_timeout_ms=wait_timeout_ms,
-                guest_mode=guest_mode,
-            )
-            _wait_for_tweet_assets(page, tweet_card)
-            _expand_tweet_text(tweet_card)
-            page.wait_for_timeout(200)
-            if translate_body:
-                _inject_chinese_translations(
-                    tweet_card,
-                    custom_translation=custom_translation,
-                    translation_overrides=translation_overrides,
-                    status_url=used_url or normalized_url,
+            # Soft-ceiling HLS may still include a top rung Chromium cannot
+            # decode (e.g. portrait 1080 avc1.640032). On failure, demote the
+            # ceiling and reload so the player re-fetches a lower multi-variant
+            # master (720p+ rungs) instead of staying stuck on Format error.
+            max_hls_attempts = 1 + len(HLS_DEMOTE_STEPS)
+            tweet_card = None
+            for hls_attempt in range(max_hls_attempts):
+                tweet_card, used_url, capture_mode = _load_tweet_card(
+                    page,
+                    normalized_url,
+                    screen_name,
+                    tweet_id,
+                    dark_mode=dark_mode,
+                    wait_timeout_ms=wait_timeout_ms,
+                    guest_mode=guest_mode,
                 )
-                _remove_native_translation_ui(tweet_card)
-            _scroll_tweet_into_view(page, tweet_card, guest_mode=guest_mode)
-            page.wait_for_timeout(250)
-            video_frames = _prepare_video_frames(tweet_card, schedule)
-            if video_frames:
-                video_frame_seconds = video_frames[0].seconds
+                _wait_for_tweet_assets(page, tweet_card)
+                _expand_tweet_text(tweet_card)
+                page.wait_for_timeout(200)
+                if translate_body:
+                    _inject_chinese_translations(
+                        tweet_card,
+                        custom_translation=custom_translation,
+                        translation_overrides=translation_overrides,
+                        status_url=used_url or normalized_url,
+                    )
+                    _remove_native_translation_ui(tweet_card)
+                _scroll_tweet_into_view(page, tweet_card, guest_mode=guest_mode)
+                page.wait_for_timeout(250)
+                video_frames = _prepare_video_frames(tweet_card, schedule)
+                if video_frames:
+                    video_frame_seconds = video_frames[0].seconds
+                    break
+                if not _tweet_video_undecodable(tweet_card):
+                    break
+                if not _demote_hls_quality_gate(page.context):
+                    break
+                if hls_attempt + 1 >= max_hls_attempts:
+                    break
 
             _prepare_tweet_for_screenshot(tweet_card)
             page.wait_for_timeout(200)
