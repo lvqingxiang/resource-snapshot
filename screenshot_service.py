@@ -3315,7 +3315,14 @@ def _load_tweet_card(
 
     for candidate_url, mode in _candidate_urls(normalized_url, screen_name, tweet_id):
         try:
-            page.goto(candidate_url, wait_until="domcontentloaded")
+            # X detail pages often stay on readyState=interactive with open media
+            # sockets, so waiting for "domcontentloaded" can hang until timeout
+            # even after the tweet article is already in the DOM.
+            page.goto(candidate_url, wait_until="commit")
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=5000)
+            except PlaywrightTimeoutError:
+                pass
             if guest_mode:
                 page.wait_for_timeout(GUEST_PAGE_SETTLE_MS)
             else:
