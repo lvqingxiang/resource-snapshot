@@ -327,8 +327,7 @@ article div[dir="auto"] {{
 }}
 
 article [data-testid="videoComponent"],
-article [data-testid="videoPlayer"],
-article [data-testid="tweetPhoto"] {{
+article [data-testid="videoPlayer"] {{
   width: 100% !important;
   max-width: 100% !important;
   margin-left: auto !important;
@@ -337,16 +336,38 @@ article [data-testid="tweetPhoto"] {{
   min-width: 0 !important;
 }}
 
-/* Large srcset/orig images must not expand the article via flex min-content sizing.
-   Do NOT force width/height on <video> — X players use absolute fill inside an
-   aspect-ratio box and overriding that breaks decoding/layout. */
+article [data-testid="tweetPhoto"] {{
+  max-width: 100% !important;
+  background: transparent !important;
+  min-width: 0 !important;
+  overflow: hidden !important;
+}}
+
+/* Single-photo posts: show the full image without expanding flex min-content.
+   Multi-photo grids keep X's cover crop via the rules below / JS prep. */
 article [data-testid="tweetPhoto"] img {{
   display: block !important;
   max-width: 100% !important;
+  background: transparent !important;
+}}
+
+article[data-resource-snapshot-single-photo] [data-testid="tweetPhoto"] {{
+  width: 100% !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+}}
+
+article[data-resource-snapshot-single-photo] [data-testid="tweetPhoto"] img {{
   width: 100% !important;
   height: auto !important;
   object-fit: contain !important;
-  background: transparent !important;
+}}
+
+article[data-resource-snapshot-multi-photo] [data-testid="tweetPhoto"] img {{
+  width: 100% !important;
+  height: 100% !important;
+  object-fit: cover !important;
+  object-position: center center !important;
 }}
 
 article video {{
@@ -631,11 +652,11 @@ def _expand_tweet_text(tweet_card) -> None:
         pass
 
 
-def _hide_non_primary_columns(page) -> None:
+def _hide_non_primary_columns(page, tweet_id: str | None = None) -> None:
     try:
         page.evaluate(
             """
-            () => {
+            (tweetId) => {
               const removeNode = (node) => {
                 if (node instanceof Element) {
                   node.remove();
@@ -644,8 +665,31 @@ def _hide_non_primary_columns(page) -> None:
 
               const hideNode = (node) => {
                 if (node instanceof HTMLElement) {
-                  node.style.display = 'none';
+                  node.style.setProperty('display', 'none', 'important');
+                  node.style.setProperty('visibility', 'hidden', 'important');
+                  node.style.setProperty('pointer-events', 'none', 'important');
+                  node.style.setProperty('height', '0', 'important');
+                  node.style.setProperty('max-height', '0', 'important');
+                  node.style.setProperty('overflow', 'hidden', 'important');
+                  node.style.setProperty('margin', '0', 'important');
+                  node.style.setProperty('padding', '0', 'important');
                 }
+              };
+
+              const articleMatchesTweet = (article) => {
+                if (!(article instanceof Element)) {
+                  return false;
+                }
+                if (!tweetId) {
+                  return true;
+                }
+                if (article.getAttribute('data-tweet-id') === tweetId) {
+                  return true;
+                }
+                if (article.querySelector(`a[href*="/status/${tweetId}"]`)) {
+                  return true;
+                }
+                return false;
               };
 
               const selectors = [
@@ -683,45 +727,84 @@ def _hide_non_primary_columns(page) -> None:
                 }
               }
 
-              // Hide adjacent tweet cells so they don't peek into the screenshot
-              const targetArticle = document.querySelector(
+              // Remove / collapse every non-target tweet cell so replies cannot peek
+              // into the screenshot after viewport resizes reflow the timeline.
+              const articles = [...document.querySelectorAll(
                 'article[data-tweet-id], article[data-testid="tweet"]'
-              );
+              )];
+              let targetArticle =
+                articles.find((article) => articleMatchesTweet(article)) || articles[0] || null;
+
+              for (const article of articles) {
+                if (article === targetArticle) {
+                  continue;
+                }
+                const cell = article.closest('[data-testid="cellInnerDiv"]') || article;
+                removeNode(cell);
+              }
+
               if (targetArticle) {
                 const targetCell = targetArticle.closest('[data-testid="cellInnerDiv"]');
                 if (targetCell?.parentElement) {
                   for (const sibling of [...targetCell.parentElement.children]) {
                     if (sibling !== targetCell && sibling instanceof HTMLElement) {
-                      hideNode(sibling);
+                      // Keep structural spacers out of the capture by removing them.
+                      if (
+                        sibling.querySelector(
+                          'article[data-tweet-id], article[data-testid="tweet"], [data-testid="User-Name"]',
+                        ) ||
+                        (sibling.textContent || '').trim().length > 0
+                      ) {
+                        removeNode(sibling);
+                      } else {
+                        hideNode(sibling);
+                      }
                     }
                   }
                 }
 
-                // Also hide siblings of any ancestor cell wrapper
+                // Also collapse siblings of any ancestor cell wrapper
                 let current = targetCell;
                 while (current?.parentElement) {
                   const parent = current.parentElement;
                   if (parent === main || parent === primary || parent === document.body) break;
                   for (const sibling of [...parent.children]) {
                     if (sibling !== current && sibling instanceof HTMLElement) {
-                      hideNode(sibling);
+                      if (
+                        sibling.querySelector(
+                          'article[data-tweet-id], article[data-testid="tweet"], [data-testid="User-Name"]',
+                        )
+                      ) {
+                        removeNode(sibling);
+                      } else {
+                        hideNode(sibling);
+                      }
                     }
                   }
                   current = parent;
                 }
               }
 
-              // Hide any remaining peek / suggestion elements
+              // Hide any remaining peek / suggestion / composer elements
               const peekSelectors = [
                 '[data-testid="tweet-detail-more-replies"]',
                 '[data-testid="conversation-more-replies"]',
                 '[data-testid="related-tweets"]',
+                '[data-testid="inline_reply_offscreen"]',
+                '[data-testid="logged_out_read_replies_pivot"]',
+                '[data-testid="inline_reply_composer"]',
+                '[data-testid="tweetTextarea_0"]',
+                'form[aria-label*="Reply"]',
+                'form[aria-label*="reply"]',
+                'form[aria-label*="回复"]',
+                'form[aria-label*="回覆"]',
               ];
               for (const sel of peekSelectors) {
-                document.querySelectorAll(sel).forEach(hideNode);
+                document.querySelectorAll(sel).forEach(removeNode);
               }
             }
-            """
+            """,
+            tweet_id,
         )
     except Exception:
         pass
@@ -2266,6 +2349,19 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                 return cls.includes('snap-x') && cls.includes('snap-mandatory');
               });
 
+              const upgradeTwimgUrl = (url, name = 'large') => {
+                if (!url || typeof url !== 'string') {
+                  return url;
+                }
+                if (!/pbs\\.twimg\\.com\\/media\\//i.test(url)) {
+                  return url;
+                }
+                if (/[?&]name=/.test(url)) {
+                  return url.replace(/([?&]name=)[^&]*/i, `$1${name}`);
+                }
+                return `${url}${url.includes('?') ? '&' : '?'}name=${name}`;
+              };
+
               const buildGridCell = (img) => {
                 const cell = document.createElement('div');
                 cell.style.position = 'relative';
@@ -2278,12 +2374,77 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                 const clone = img.cloneNode(true);
                 clone.removeAttribute('style');
                 clone.className = '';
+                if (clone instanceof HTMLImageElement) {
+                  const upgraded = upgradeTwimgUrl(clone.currentSrc || clone.src, 'large');
+                  if (upgraded) {
+                    clone.src = upgraded;
+                  }
+                  clone.removeAttribute('srcset');
+                  clone.sizes = '100vw';
+                }
                 clone.style.width = '100%';
                 clone.style.height = '100%';
                 clone.style.objectFit = 'cover';
+                clone.style.objectPosition = 'center center';
                 clone.style.display = 'block';
                 cell.appendChild(clone);
                 return cell;
+              };
+
+              // Carousel parents keep a short landscape frame. After we rebuild a
+              // taller 2x2 grid, unlock those ancestors or the bottom row gets
+              // clipped into "forehead-only" peeks.
+              const unlockMediaAncestors = (mediaEl) => {
+                if (!(mediaEl instanceof HTMLElement)) {
+                  return;
+                }
+                let node = mediaEl.parentElement;
+                while (node instanceof HTMLElement && node !== root) {
+                  node.style.height = 'auto';
+                  node.style.maxHeight = 'none';
+                  node.style.minHeight = '0';
+                  node.style.aspectRatio = 'auto';
+                  node.style.flex = '0 0 auto';
+                  node.style.maxWidth = '100%';
+                  node.style.width = '100%';
+                  if (node !== mediaEl) {
+                    const overflowY = window.getComputedStyle(node).overflowY;
+                    if (overflowY === 'hidden' || overflowY === 'clip') {
+                      node.style.overflow = 'visible';
+                      node.style.overflowY = 'visible';
+                    }
+                  }
+                  node = node.parentElement;
+                }
+              };
+
+              const mountPhotoGrid = (carousel, grid, imageCount) => {
+                if (imageCount <= 1) {
+                  return;
+                }
+                if (imageCount === 2) {
+                  grid.style.aspectRatio = '16 / 9';
+                } else if (imageCount === 3) {
+                  grid.style.aspectRatio = '4 / 3';
+                } else {
+                  // Match X's 4-photo mosaic more closely than a perfect square.
+                  grid.style.aspectRatio = '7 / 8';
+                }
+                grid.style.height = 'auto';
+                grid.style.minHeight = '0';
+                grid.style.maxHeight = 'none';
+                carousel.replaceWith(grid);
+                unlockMediaAncestors(grid);
+
+                // Force a concrete height from the final width so 1fr rows cannot
+                // collapse inside a still-constrained parent during layout.
+                const width = grid.getBoundingClientRect().width;
+                if (width > 1) {
+                  const ratio = imageCount === 2 ? 9 / 16 : imageCount === 3 ? 3 / 4 : 8 / 7;
+                  const height = Math.round(width * ratio);
+                  grid.style.height = `${height}px`;
+                  grid.style.aspectRatio = 'auto';
+                }
               };
 
               for (const carousel of carousels) {
@@ -2397,18 +2558,17 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                 grid.style.gap = '2px';
                 grid.style.borderRadius = '16px';
                 grid.style.overflow = 'hidden';
+                grid.style.background = '#000';
 
                 if (images.length === 2) {
                   grid.style.gridTemplateColumns = '1fr 1fr';
                   grid.style.gridTemplateRows = '1fr';
-                  grid.style.aspectRatio = '16 / 9';
                   for (const img of images.slice(0, 2)) {
                     grid.appendChild(buildGridCell(img));
                   }
                 } else if (images.length === 3) {
                   grid.style.gridTemplateColumns = '1fr 1fr';
                   grid.style.gridTemplateRows = '1fr 1fr';
-                  grid.style.aspectRatio = '4 / 3';
                   const cells = images.slice(0, 3).map((img) => buildGridCell(img));
                   cells[0].style.gridRow = '1 / span 2';
                   cells[0].style.gridColumn = '1';
@@ -2422,24 +2582,42 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                 } else {
                   grid.style.gridTemplateColumns = '1fr 1fr';
                   grid.style.gridTemplateRows = '1fr 1fr';
-                  grid.style.aspectRatio = '1 / 1';
                   for (const img of images.slice(0, 4)) {
                     grid.appendChild(buildGridCell(img));
                   }
                 }
 
-                carousel.replaceWith(grid);
+                mountPhotoGrid(carousel, grid, images.length);
               }
 
-              const constrainMediaTree = (mediaEl) => {
+              const tweetRoot = root.matches('article')
+                ? root
+                : root.querySelector('article') || root;
+              const photoRoots = [...root.querySelectorAll('[data-testid="tweetPhoto"]')].filter(
+                (node) => node instanceof HTMLElement,
+              );
+              const multiPhoto = photoRoots.length > 1;
+              if (tweetRoot instanceof HTMLElement) {
+                tweetRoot.toggleAttribute('data-resource-snapshot-single-photo', !multiPhoto && photoRoots.length === 1);
+                tweetRoot.toggleAttribute('data-resource-snapshot-multi-photo', multiPhoto);
+              }
+
+              const constrainMediaTree = (mediaEl, { fillCover = false } = {}) => {
                 if (!(mediaEl instanceof HTMLElement)) {
                   return;
                 }
                 mediaEl.style.setProperty('max-width', '100%', 'important');
                 mediaEl.style.setProperty('width', '100%', 'important');
-                mediaEl.style.setProperty('height', 'auto', 'important');
-                mediaEl.style.setProperty('object-fit', 'contain', 'important');
                 mediaEl.style.setProperty('display', 'block', 'important');
+                if (fillCover) {
+                  // Multi-photo / rebuilt grids: keep center cover crop like X.
+                  mediaEl.style.setProperty('height', '100%', 'important');
+                  mediaEl.style.setProperty('object-fit', 'cover', 'important');
+                  mediaEl.style.setProperty('object-position', 'center center', 'important');
+                } else {
+                  mediaEl.style.setProperty('height', 'auto', 'important');
+                  mediaEl.style.setProperty('object-fit', 'contain', 'important');
+                }
 
                 let node = mediaEl.parentElement;
                 while (node instanceof HTMLElement && node !== root) {
@@ -2449,8 +2627,10 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                   if (node.getAttribute('data-testid') === 'tweetPhoto' ||
                       node.getAttribute('data-testid') === 'videoComponent' ||
                       node.getAttribute('data-testid') === 'videoPlayer') {
-                    node.style.width = '100%';
-                    node.style.borderRadius = '16px';
+                    if (!multiPhoto || node.getAttribute('data-testid') !== 'tweetPhoto') {
+                      node.style.width = '100%';
+                    }
+                    node.style.borderRadius = multiPhoto ? '0' : '16px';
                     break;
                   }
                   node = node.parentElement;
@@ -2461,16 +2641,38 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                 if (!isMediaImage(img)) {
                   continue;
                 }
-                constrainMediaTree(img);
+                // Custom rebuilt grids already use cover + height 100% via CSS.
+                // Forcing height:auto here clips portrait cells to the top edge.
+                if (img.closest(`[${GRID_ATTR}]`)) {
+                  continue;
+                }
+                const inTweetPhoto = Boolean(img.closest('[data-testid="tweetPhoto"]'));
+                constrainMediaTree(img, { fillCover: multiPhoto && inTweetPhoto });
               }
 
-              for (const photoRoot of root.querySelectorAll('[data-testid="tweetPhoto"]')) {
-                if (photoRoot instanceof HTMLElement) {
+              for (const photoRoot of photoRoots) {
+                photoRoot.style.overflow = 'hidden';
+                photoRoot.style.maxWidth = '100%';
+                photoRoot.style.minWidth = '0';
+                if (!multiPhoto) {
                   photoRoot.style.borderRadius = '16px';
-                  photoRoot.style.overflow = 'hidden';
-                  photoRoot.style.maxWidth = '100%';
                   photoRoot.style.width = '100%';
-                  photoRoot.style.minWidth = '0';
+                }
+              }
+
+              // Keep the outer multi-photo frame rounded like X.
+              if (multiPhoto) {
+                const firstPhoto = photoRoots[0];
+                let frame = firstPhoto?.parentElement;
+                while (frame instanceof HTMLElement && frame !== root) {
+                  const photosInFrame = frame.querySelectorAll('[data-testid="tweetPhoto"]').length;
+                  if (photosInFrame >= photoRoots.length) {
+                    frame.style.borderRadius = '16px';
+                    frame.style.overflow = 'hidden';
+                    frame.style.maxWidth = '100%';
+                    break;
+                  }
+                  frame = frame.parentElement;
                 }
               }
             }
@@ -3003,30 +3205,47 @@ def _compute_capture_clip(page, tweet_card):
             }
           }
 
+          const engagementSelector = [
+            '[data-testid="reply"]',
+            '[data-testid="retweet"]',
+            '[data-testid="like"]',
+            '[data-testid="bookmark"]',
+            '[data-testid="share"]',
+          ].join(', ');
+
           const actionGroups = [...el.querySelectorAll('[role="group"]')]
-            .filter((node) => isVisible(node) && !shouldExclude(node))
+            .filter((node) => isVisible(node))
             .map((node) => {
               const rect = node.getBoundingClientRect();
               return {
+                node,
                 top: rect.top + window.scrollY,
                 bottom: rect.bottom + window.scrollY,
                 width: rect.width,
                 height: rect.height,
                 text: (node.innerText || '').trim(),
+                hasEngagementButton: Boolean(node.querySelector(engagementSelector)),
               };
             })
             .filter((rect) => {
-              if (rect.width < 220 || rect.height < 12) {
+              if (rect.width < 180 || rect.height < 12) {
                 return false;
               }
-              const nearBottom = rect.bottom >= rootRect.top + rootRect.height * 0.62;
-              const looksLikeEngagement = /reply|repost|like|bookmark|share|回复|转推|喜欢|收藏|分享/i.test(
+              // Engagement buttons live inside the bar; do not exclude the whole
+              // group just because it contains [data-testid="reply"].
+              const nearBottom = rect.bottom >= rootRect.top + rootRect.height * 0.45;
+              const looksLikeEngagement = /reply|repost|retweet|like|bookmark|share|回复|转推|喜欢|收藏|分享/i.test(
                 rect.text,
               );
-              return nearBottom || looksLikeEngagement;
+              return rect.hasEngagementButton || nearBottom || looksLikeEngagement;
             });
 
-          const actionBar = actionGroups.sort((a, b) => b.bottom - a.bottom)[0];
+          const actionBar = actionGroups.sort((a, b) => {
+            if (a.hasEngagementButton !== b.hasEngagementButton) {
+              return a.hasEngagementButton ? -1 : 1;
+            }
+            return b.bottom - a.bottom;
+          })[0];
 
           const rootX = rootRect.left + window.scrollX;
           const rootY = rootRect.top + window.scrollY;
@@ -3040,7 +3259,11 @@ def _compute_capture_clip(page, tweet_card):
             bottom = rootBottom;
           } else {
             top = Math.min(top, rootY);
-            bottom = Math.max(bottom, rootBottom);
+            // Prefer measured content over the full article box. Conversation
+            // chrome / trailing spacers can inflate rootBottom past the tweet.
+            if (!actionBar) {
+              bottom = Math.max(bottom, rootBottom);
+            }
           }
 
           left = rootX;
@@ -3050,7 +3273,13 @@ def _compute_capture_clip(page, tweet_card):
           const x = Math.max(0, Math.floor(left - padding));
           const y = Math.max(0, Math.floor(top - padding));
           const maxRight = Math.max(doc.scrollWidth, right + padding);
-          const contentBottom = actionBar ? Math.min(bottom, actionBar.bottom) : bottom;
+          // Hard-stop at the engagement row so replies under the detail tweet
+          // never enter the capture rectangle. Prefer the bar itself as the
+          // bottom edge; measured content can undershoot (cut off icons) or
+          // overshoot (include peeks from neighboring cells).
+          const contentBottom = actionBar
+            ? actionBar.bottom
+            : Math.min(bottom, rootBottom);
           const maxBottom = Math.max(doc.scrollHeight, contentBottom + padding);
           const width = Math.max(1, Math.ceil(Math.min(maxRight, right + padding) - x));
           let height = Math.max(1, Math.ceil(Math.min(maxBottom, contentBottom + padding) - y));
@@ -3096,20 +3325,32 @@ def _ensure_viewport_can_fit_clip(page, clip: dict[str, int] | None) -> bool:
     return True
 
 
-def _capture_detail_snapshot(page, tweet_card, path: Path) -> None:
-    _hide_non_primary_columns(page)
+def _capture_detail_snapshot(
+    page,
+    tweet_card,
+    path: Path,
+    *,
+    tweet_id: str | None = None,
+) -> None:
+    _hide_non_primary_columns(page, tweet_id)
     _scroll_tweet_into_view(page, tweet_card, guest_mode=True)
 
     clip = _compute_capture_clip(page, tweet_card)
     if _ensure_viewport_can_fit_clip(page, clip):
         _wait_for_tweet_assets(page, tweet_card)
         page.wait_for_timeout(200)
+        _hide_non_primary_columns(page, tweet_id)
         _scroll_tweet_into_view(page, tweet_card, guest_mode=True)
         clip = _compute_capture_clip(page, tweet_card)
         if _ensure_viewport_can_fit_clip(page, clip):
             page.wait_for_timeout(200)
+            _hide_non_primary_columns(page, tweet_id)
             _scroll_tweet_into_view(page, tweet_card, guest_mode=True)
             clip = _compute_capture_clip(page, tweet_card)
+
+    # Final pass: replies can remount after viewport/layout changes.
+    _hide_non_primary_columns(page, tweet_id)
+    clip = _compute_capture_clip(page, tweet_card) or clip
 
     if clip:
         page.screenshot(
@@ -3339,7 +3580,7 @@ def _load_tweet_card(
             _expand_tweet_text(tweet_card)
             page.wait_for_timeout(250)
             page.add_style_tag(content=_detail_capture_css(dark_mode))
-            _hide_non_primary_columns(page)
+            _hide_non_primary_columns(page, tweet_id)
             if not guest_mode:
                 _dismiss_common_overlays(page)
             return tweet_card, candidate_url, mode
@@ -3504,7 +3745,12 @@ def capture_tweet_page(
 
             _prepare_tweet_for_screenshot(tweet_card)
             page.wait_for_timeout(200)
-            _capture_detail_snapshot(page, tweet_card, saved_to)
+            _capture_detail_snapshot(
+                page,
+                tweet_card,
+                saved_to,
+                tweet_id=tweet_id,
+            )
         finally:
             session.close()
 
