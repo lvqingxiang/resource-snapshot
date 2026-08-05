@@ -794,13 +794,39 @@ def _hide_non_primary_columns(page, tweet_id: str | None = None) -> None:
                 '[data-testid="logged_out_read_replies_pivot"]',
                 '[data-testid="inline_reply_composer"]',
                 '[data-testid="tweetTextarea_0"]',
+                '[data-testid="tweetButtonInline"]',
                 'form[aria-label*="Reply"]',
                 'form[aria-label*="reply"]',
                 'form[aria-label*="回复"]',
                 'form[aria-label*="回覆"]',
+                'output',
               ];
               for (const sel of peekSelectors) {
                 document.querySelectorAll(sel).forEach(removeNode);
+              }
+
+              // Drop every timeline cell after the target tweet (reply composer
+              // skeletons, "only some accounts can reply", next tweets, etc.).
+              if (targetArticle) {
+                const targetCell =
+                  targetArticle.closest('[data-testid="cellInnerDiv"]') || targetArticle;
+                let sibling = targetCell.nextElementSibling;
+                while (sibling) {
+                  const next = sibling.nextElementSibling;
+                  removeNode(sibling);
+                  sibling = next;
+                }
+                // Also clear later siblings of ancestor section wrappers.
+                let current = targetCell.parentElement;
+                while (current && current !== main && current !== primary && current !== document.body) {
+                  sibling = current.nextElementSibling;
+                  while (sibling) {
+                    const next = sibling.nextElementSibling;
+                    removeNode(sibling);
+                    sibling = next;
+                  }
+                  current = current.parentElement;
+                }
               }
             }
             """,
@@ -2647,7 +2673,18 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                   continue;
                 }
                 const inTweetPhoto = Boolean(img.closest('[data-testid="tweetPhoto"]'));
-                constrainMediaTree(img, { fillCover: multiPhoto && inTweetPhoto });
+                if (multiPhoto && inTweetPhoto) {
+                  constrainMediaTree(img, { fillCover: true });
+                  continue;
+                }
+                if (inTweetPhoto && photoRoots.length === 1) {
+                  constrainMediaTree(img, { fillCover: false });
+                  continue;
+                }
+                // Guest / markup without tweetPhoto: keep the on-page frame.
+                // Forcing height:auto blows a constrained portrait into full
+                // natural height and leaves empty chrome under the tweet.
+                img.style.setProperty('max-width', '100%', 'important');
               }
 
               for (const photoRoot of photoRoots) {
@@ -2706,6 +2743,29 @@ def _prepare_tweet_for_screenshot(tweet_card) -> None:
                 }
               };
 
+              const replyRestrictionPattern =
+                /only some accounts can reply|who can reply|仅限部分|只有部分.*回复|回复受限|このポストに返信|返信できるの/i;
+
+              // Guest detail pages put the lock banner in <output>; remove it and
+              // any similarly worded chrome so it cannot pad the screenshot.
+              root.querySelectorAll('output').forEach(removeNode);
+              for (const node of [...root.querySelectorAll('div, aside, section, span')]) {
+                if (!(node instanceof HTMLElement)) {
+                  continue;
+                }
+                const text = (node.innerText || node.textContent || '').trim();
+                if (!text || text.length > 120) {
+                  continue;
+                }
+                if (replyRestrictionPattern.test(text)) {
+                  const removable =
+                    node.closest('output') ||
+                    (node.children.length <= 3 ? node : null) ||
+                    node;
+                  removeNode(removable);
+                }
+              }
+
               const replySelectors = [
                 '[data-testid="logged_out_read_replies_pivot"]',
                 '[data-testid="inline_reply_offscreen"]',
@@ -2734,6 +2794,28 @@ def _prepare_tweet_for_screenshot(tweet_card) -> None:
               tweetRoot.style.marginLeft = 'auto';
               tweetRoot.style.marginRight = 'auto';
 
+              const engagementSelector = [
+                '[data-testid="reply"]',
+                '[data-testid="retweet"]',
+                '[data-testid="like"]',
+                '[data-testid="bookmark"]',
+                '[data-testid="share"]',
+              ].join(', ');
+              const engagementAria =
+                /^(reply|repost|retweet|like|bookmark|share|回复|转推|喜欢|收藏|分享)\\b/i;
+
+              const findEngagementButtons = (scope) =>
+                [...scope.querySelectorAll('button, a, [role="button"]')].filter((node) => {
+                  if (!isVisible(node)) {
+                    return false;
+                  }
+                  if (node.matches(engagementSelector) || node.closest(engagementSelector)) {
+                    return true;
+                  }
+                  const label = (node.getAttribute('aria-label') || '').trim();
+                  return engagementAria.test(label);
+                });
+
               const rootRect = tweetRoot.getBoundingClientRect();
               const actionGroups = [...tweetRoot.querySelectorAll('[role="group"]')]
                 .filter(isVisible)
@@ -2746,7 +2828,7 @@ def _prepare_tweet_for_screenshot(tweet_card) -> None:
                   };
                 })
                 .filter((entry) => {
-                  if (entry.rect.width < 220 || entry.rect.height < 12) {
+                  if (entry.rect.width < 180 || entry.rect.height < 12) {
                     return false;
                   }
                   if (
@@ -2757,18 +2839,46 @@ def _prepare_tweet_for_screenshot(tweet_card) -> None:
                     return false;
                   }
                   const hasEngagementButton = Boolean(
-                    entry.node.querySelector(
-                      '[data-testid="reply"], [data-testid="retweet"], [data-testid="like"], [data-testid="bookmark"], [data-testid="share"]',
-                    ),
+                    entry.node.querySelector(engagementSelector) ||
+                      findEngagementButtons(entry.node).length > 0,
                   );
                   const looksLikeEngagement = /reply|repost|retweet|like|bookmark|share|回复|转推|喜欢|收藏|分享/i.test(
                     entry.text,
                   );
                   return hasEngagementButton || looksLikeEngagement;
                 });
-              const actionBar = actionGroups.sort(
+              let actionBar = actionGroups.sort(
                 (a, b) => b.rect.bottom - a.rect.bottom,
               )[0]?.node;
+
+              // Guest UI often has no role=group / data-testid; fall back to the
+              // shared parent of aria-labelled engagement buttons.
+              if (!actionBar) {
+                const buttons = findEngagementButtons(tweetRoot);
+                if (buttons.length >= 2) {
+                  let common = buttons[0].parentElement;
+                  while (
+                    common &&
+                    common !== tweetRoot &&
+                    !buttons.every((button) => common.contains(button))
+                  ) {
+                    common = common.parentElement;
+                  }
+                  if (common && common !== tweetRoot) {
+                    // Prefer a reasonably wide row rather than a tiny icon wrapper.
+                    let candidate = common;
+                    while (candidate && candidate !== tweetRoot) {
+                      const rect = candidate.getBoundingClientRect();
+                      if (rect.width >= Math.min(220, rootRect.width * 0.55)) {
+                        actionBar = candidate;
+                        break;
+                      }
+                      candidate = candidate.parentElement;
+                    }
+                    actionBar = actionBar || common;
+                  }
+                }
+              }
 
               if (actionBar) {
                 const containsFooterMetadata = (node) => {
@@ -2809,6 +2919,19 @@ def _prepare_tweet_for_screenshot(tweet_card) -> None:
                     break;
                   }
                   pivot = parent;
+                }
+              }
+
+              // Final sweep in case the lock banner remounted or sat outside the
+              // engagement-bar sibling walk.
+              root.querySelectorAll('output').forEach(removeNode);
+              for (const node of [...root.querySelectorAll('div, aside, section')]) {
+                if (!(node instanceof HTMLElement)) {
+                  continue;
+                }
+                const text = (node.innerText || '').trim();
+                if (text && text.length <= 120 && replyRestrictionPattern.test(text)) {
+                  removeNode(node);
                 }
               }
 
@@ -3079,7 +3202,8 @@ def _compute_capture_clip(page, tweet_card):
             'form[aria-label*="Reply"]',
             'form[aria-label*="reply"]',
             'form[aria-label*="回复"]',
-            'form[aria-label*="回覆"]'
+            'form[aria-label*="回覆"]',
+            'output',
           ].join(', ');
 
           let left = Infinity;
@@ -3212,6 +3336,24 @@ def _compute_capture_clip(page, tweet_card):
             '[data-testid="bookmark"]',
             '[data-testid="share"]',
           ].join(', ');
+          const engagementAria =
+            /^(reply|repost|retweet|like|bookmark|share|回复|转推|喜欢|收藏|分享)\\b/i;
+
+          const findEngagementButtons = (scope) =>
+            [...scope.querySelectorAll('button, a, [role="button"]')].filter((node) => {
+              if (!isVisible(node)) {
+                return false;
+              }
+              if (node.matches(engagementSelector) || node.querySelector(engagementSelector)) {
+                return true;
+              }
+              // Guest UI uses aria-label without data-testid.
+              if (node.closest(engagementSelector)) {
+                return true;
+              }
+              const label = (node.getAttribute('aria-label') || '').trim();
+              return engagementAria.test(label);
+            });
 
           const actionGroups = [...el.querySelectorAll('[role="group"]')]
             .filter((node) => isVisible(node))
@@ -3224,15 +3366,16 @@ def _compute_capture_clip(page, tweet_card):
                 width: rect.width,
                 height: rect.height,
                 text: (node.innerText || '').trim(),
-                hasEngagementButton: Boolean(node.querySelector(engagementSelector)),
+                hasEngagementButton: Boolean(
+                  node.querySelector(engagementSelector) ||
+                    findEngagementButtons(node).length > 0,
+                ),
               };
             })
             .filter((rect) => {
               if (rect.width < 180 || rect.height < 12) {
                 return false;
               }
-              // Engagement buttons live inside the bar; do not exclude the whole
-              // group just because it contains [data-testid="reply"].
               const nearBottom = rect.bottom >= rootRect.top + rootRect.height * 0.45;
               const looksLikeEngagement = /reply|repost|retweet|like|bookmark|share|回复|转推|喜欢|收藏|分享/i.test(
                 rect.text,
@@ -3240,12 +3383,39 @@ def _compute_capture_clip(page, tweet_card):
               return rect.hasEngagementButton || nearBottom || looksLikeEngagement;
             });
 
-          const actionBar = actionGroups.sort((a, b) => {
+          let actionBar = actionGroups.sort((a, b) => {
             if (a.hasEngagementButton !== b.hasEngagementButton) {
               return a.hasEngagementButton ? -1 : 1;
             }
             return b.bottom - a.bottom;
           })[0];
+
+          if (!actionBar) {
+            const buttons = findEngagementButtons(el);
+            if (buttons.length > 0) {
+              let bottom = -Infinity;
+              let top = Infinity;
+              let leftmost = Infinity;
+              let rightmost = -Infinity;
+              for (const button of buttons) {
+                const rect = button.getBoundingClientRect();
+                bottom = Math.max(bottom, rect.bottom + window.scrollY);
+                top = Math.min(top, rect.top + window.scrollY);
+                leftmost = Math.min(leftmost, rect.left + window.scrollX);
+                rightmost = Math.max(rightmost, rect.right + window.scrollX);
+              }
+              if (Number.isFinite(bottom)) {
+                actionBar = {
+                  top,
+                  bottom,
+                  width: Math.max(1, rightmost - leftmost),
+                  height: Math.max(1, bottom - top),
+                  text: '',
+                  hasEngagementButton: true,
+                };
+              }
+            }
+          }
 
           const rootX = rootRect.left + window.scrollX;
           const rootY = rootRect.top + window.scrollY;
@@ -3270,19 +3440,18 @@ def _compute_capture_clip(page, tweet_card):
           right = rootRight;
 
           const padding = 12;
+          const bottomPadding = actionBar ? 8 : padding;
           const x = Math.max(0, Math.floor(left - padding));
           const y = Math.max(0, Math.floor(top - padding));
           const maxRight = Math.max(doc.scrollWidth, right + padding);
-          // Hard-stop at the engagement row so replies under the detail tweet
-          // never enter the capture rectangle. Prefer the bar itself as the
-          // bottom edge; measured content can undershoot (cut off icons) or
-          // overshoot (include peeks from neighboring cells).
+          // Hard-stop at the engagement row so reply-lock banners / replies
+          // under the detail tweet never enter the capture rectangle.
           const contentBottom = actionBar
             ? actionBar.bottom
             : Math.min(bottom, rootBottom);
-          const maxBottom = Math.max(doc.scrollHeight, contentBottom + padding);
+          const maxBottom = Math.max(doc.scrollHeight, contentBottom + bottomPadding);
           const width = Math.max(1, Math.ceil(Math.min(maxRight, right + padding) - x));
-          let height = Math.max(1, Math.ceil(Math.min(maxBottom, contentBottom + padding) - y));
+          let height = Math.max(1, Math.ceil(Math.min(maxBottom, contentBottom + bottomPadding) - y));
 
           // Guard against flex/min-content blowups from large orig/srcset images.
           // A detail card with quote media should rarely exceed ~4x column width.
