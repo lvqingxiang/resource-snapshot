@@ -525,6 +525,15 @@ def _extract_parts(url: str) -> tuple[str, str]:
     return match.group("screen_name"), match.group("tweet_id")
 
 
+def _extract_status_id_from_url(url: str | None) -> str | None:
+    match = re.search(
+        r"/(?:i/(?:web/)?status|[^/?#]+/status)/(?P<tweet_id>\d+)",
+        url or "",
+        flags=re.IGNORECASE,
+    )
+    return match.group("tweet_id") if match else None
+
+
 def _candidate_urls(original_url: str, screen_name: str, tweet_id: str) -> list[tuple[str, str]]:
     parsed = urlparse(original_url)
     original_host = parsed.netloc.lower() or "x.com"
@@ -737,6 +746,9 @@ def _hide_non_primary_columns(page, tweet_id: str | None = None) -> None:
 
               for (const article of articles) {
                 if (article === targetArticle) {
+                  continue;
+                }
+                if (targetArticle?.contains(article)) {
                   continue;
                 }
                 const cell = article.closest('[data-testid="cellInnerDiv"]') || article;
@@ -1161,10 +1173,141 @@ def _seed_original_text_from_oembed(tweet_card, original_text: str, lang: str | 
         pass
 
 
+def _apply_oembed_originals_to_blocks(
+    tweet_card,
+    replacements: list[dict[str, str | int | None]],
+) -> None:
+    if not replacements:
+        return
+    try:
+        tweet_card.evaluate(
+            f"""
+            (root, replacements) => {{
+              const collectAnchors = {_TEXT_ANCHOR_COLLECTION_JS};
+              const anchors = collectAnchors(root);
+              for (const replacement of replacements || []) {{
+                const index = Number(replacement.index);
+                const anchor = anchors[index];
+                const text = (replacement.text || '').trim();
+                if (!anchor || !text) {{
+                  continue;
+                }}
+                anchor.setAttribute('data-rs-original-text', text);
+                if (replacement.lang) {{
+                  anchor.setAttribute('data-rs-original-lang', replacement.lang);
+                  anchor.setAttribute('lang', replacement.lang);
+                }}
+                anchor.textContent = text;
+              }}
+            }}
+            """,
+            replacements,
+        )
+    except Exception:
+        pass
+
+
+def _extract_quoted_status_urls(tweet_card, status_url: str | None = None) -> list[str]:
+    main_id = _extract_status_id_from_url(status_url)
+    try:
+        urls = tweet_card.evaluate(
+            """
+            (root, mainId) => {
+              const idFromHref = (href) => {
+                const match = String(href || '').match(/\\/(?:i\\/(?:web\\/)?status|[^/?#]+\\/status)\\/(\\d+)/i);
+                return match ? match[1] : '';
+              };
+              const normalize = (href) => {
+                try {
+                  const url = new URL(href, 'https://x.com');
+                  return `${url.origin}${url.pathname}`;
+                } catch (error) {
+                  return href || '';
+                }
+              };
+
+              const seen = new Set();
+              const out = [];
+              for (const anchor of root.querySelectorAll('a[href*="/status/"], a[href*="/i/web/status/"], a[href*="/i/status/"]')) {
+                const href = anchor.href || anchor.getAttribute('href') || '';
+                const id = idFromHref(href);
+                if (!id || id === mainId || seen.has(id)) {
+                  continue;
+                }
+                seen.add(id);
+                out.push(normalize(href));
+              }
+              return out;
+            }
+            """,
+            main_id or "",
+        )
+    except Exception:
+        return []
+
+    if not isinstance(urls, list):
+        return []
+    return [str(url).strip() for url in urls if str(url or "").strip()]
+
+
 def _collect_translation_text_blocks(tweet_card, status_url: str | None = None) -> list[dict[str, str | int | None]]:
-    """Extract tweet bodies for translation, with oEmbed fallback when X auto-translated to Chinese."""
+    """Extract tweet bodies for translation, with per-tweet oEmbed fallback for quoted posts."""
     _dismiss_x_auto_translation(tweet_card)
     text_blocks = _extract_translatable_text_blocks(tweet_card)
+
+    replacements: list[dict[str, str | int | None]] = []
+    for block in text_blocks:
+        text = str(block.get("text") or "").strip()
+        block_url = str(block.get("status_url") or status_url or "").strip()
+        if not text or not block_url:
+            continue
+        if _text_looks_non_chinese(text):
+            continue
+
+        oembed_text, oembed_lang = _fetch_oembed_tweet_body(block_url)
+        if not oembed_text or not _text_looks_non_chinese(oembed_text):
+            continue
+
+        block["text"] = oembed_text
+        block["lang"] = oembed_lang or block.get("lang") or ""
+        replacements.append(
+            {
+                "index": block.get("index"),
+                "text": oembed_text,
+                "lang": oembed_lang or "",
+            }
+        )
+
+    if replacements:
+        _apply_oembed_originals_to_blocks(tweet_card, replacements)
+        text_blocks = _extract_translatable_text_blocks(tweet_card)
+
+    seen_ids = {
+        _extract_status_id_from_url(str(block.get("status_url") or status_url or ""))
+        for block in text_blocks
+    }
+    seen_ids.discard(None)
+    seen_texts = {str(block.get("text") or "").strip() for block in text_blocks if block.get("text")}
+    for quoted_url in _extract_quoted_status_urls(tweet_card, status_url):
+        quoted_id = _extract_status_id_from_url(quoted_url)
+        if not quoted_id or quoted_id in seen_ids:
+            continue
+        oembed_text, oembed_lang = _fetch_oembed_tweet_body(quoted_url)
+        if not oembed_text or not _text_looks_non_chinese(oembed_text):
+            continue
+        if oembed_text in seen_texts:
+            continue
+        text_blocks.append(
+            {
+                "index": len(text_blocks),
+                "text": oembed_text,
+                "lang": oembed_lang or "",
+                "status_url": quoted_url,
+            }
+        )
+        seen_ids.add(quoted_id)
+        seen_texts.add(oembed_text)
+
     if any(_text_looks_non_chinese(str(block.get("text") or "")) for block in text_blocks):
         return text_blocks
 
@@ -1275,13 +1418,14 @@ _TEXT_ANCHOR_COLLECTION_JS = f"""
     if (!(node instanceof Element)) {{
       return false;
     }}
+    const quotedRoot = node.closest('[data-testid="quoteTweet"]');
     if (node.closest('[data-testid="User-Name"]')) {{
       return false;
     }}
     if (node.closest('[data-testid="socialContext"]')) {{
       return false;
     }}
-    if (node.closest('[role="group"]')) {{
+    if (node.closest('[role="group"]') && !quotedRoot) {{
       return false;
     }}
     if (node.closest('[{TRANSLATION_ATTR}="block"]')) {{
@@ -1339,6 +1483,14 @@ def _extract_translatable_text_blocks(tweet_card) -> list[dict[str, str | int | 
               const looksMostlyChinese = {_LOOKS_MOSTLY_CHINESE_JS};
 
               return anchors.map((node, index) => {{
+                const quotedRoot = node.closest('[data-testid="quoteTweet"]');
+                const statusAnchor = quotedRoot
+                  ? (
+                    node.closest('a[href*="/status/"], a[href*="/i/web/status/"]')
+                    || quotedRoot.querySelector('a[href*="/status/"], a[href*="/i/web/status/"]')
+                  )
+                  : null;
+                const statusUrl = statusAnchor?.href || '';
                 // Prefer the original text captured by MutationObserver before X auto-translated it,
                 // but if "Show original" restored a non-Chinese body, trust the live DOM instead.
                 const origText = (node.getAttribute('data-rs-original-text') || '').trim();
@@ -1368,7 +1520,7 @@ def _extract_translatable_text_blocks(tweet_card) -> list[dict[str, str | int | 
                 if (text === origText && origLang) {{
                   lang = origLang;
                 }}
-                return {{ index, text, lang }};
+                return {{ index, text, lang, status_url: statusUrl }};
               }});
             }}
             """
@@ -1564,6 +1716,7 @@ def _build_translation_items(
                 "index": int(block["index"]),
                 "text": text,
                 "translation": translation,
+                "status_url": str(block.get("status_url") or ""),
             }
         )
 
@@ -1593,6 +1746,27 @@ def _inject_chinese_translations(
             f"""
             (root, entries) => {{
               const collectAnchors = {_TEXT_ANCHOR_COLLECTION_JS};
+              const statusIdFromUrl = (href) => {{
+                const match = String(href || '').match(/\\/(?:i\\/(?:web\\/)?status|[^/?#]+\\/status)\\/(\\d+)/i);
+                return match ? match[1] : '';
+              }};
+              const findAnchorByStatusUrl = (statusUrl) => {{
+                const targetId = statusIdFromUrl(statusUrl);
+                if (!targetId) {{
+                  return null;
+                }}
+                const link = [...root.querySelectorAll('a[href*="/status/"], a[href*="/i/web/status/"], a[href*="/i/status/"]')]
+                  .find((anchor) => statusIdFromUrl(anchor.href || anchor.getAttribute('href')) === targetId);
+                if (!link) {{
+                  return null;
+                }}
+                const quoteRoot = link.closest('[data-testid="quoteTweet"], [data-testid="card.wrapper"], div[role="link"]');
+                if (!quoteRoot) {{
+                  return link;
+                }}
+                const textNode = quoteRoot.querySelector('[data-testid="tweetText"], div[dir="auto"]');
+                return textNode || quoteRoot;
+              }};
 
               root.querySelectorAll('[{TRANSLATION_ATTR}="block"]').forEach((node) => node.remove());
               const blocks = collectAnchors(root);
@@ -1601,7 +1775,8 @@ def _inject_chinese_translations(
               for (const entry of entries) {{
                 const anchor =
                   blocks[entry.index] ||
-                  blocks.find((node) => (node.innerText || '').trim() === (entry.text || '').trim());
+                  blocks.find((node) => (node.innerText || '').trim() === (entry.text || '').trim()) ||
+                  findAnchorByStatusUrl(entry.status_url || '');
                 if (!anchor || !entry.translation) {{
                   continue;
                 }}
@@ -3131,47 +3306,6 @@ def _prepare_tweet_for_screenshot(tweet_card) -> None:
                 hideVideoControlChrome(video);
                 trimVideoContainer(video);
               }
-
-              // Reformat timestamp links from UTC to Asia/Shanghai (UTC+8)
-              const reformatTimestamps = () => {
-                const CST_OFFSET_H = 8;
-                for (const el of root.querySelectorAll('a, time, span')) {
-                  const text = (el.textContent || '').trim();
-                  // Match pattern: "HH:MM · YYYY年M月D日" or "HH:MM AM/PM · YYYY年M月D日"
-                  const match = text.match(/^(\\d{1,2}):(\\d{2})\\s*(AM|PM)?\\s*[\\u00b7\\u2027\\u2219]\\s*(\\d{4})\\u5e74(\\d{1,2})\\u6708(\\d{1,2})\\u65e5$/i);
-                  if (!match) continue;
-
-                  let hours = parseInt(match[1], 10);
-                  const minutes = parseInt(match[2], 10);
-                  const ampm = (match[3] || '').toUpperCase();
-                  let year = parseInt(match[4], 10);
-                  let month = parseInt(match[5], 10);
-                  let day = parseInt(match[6], 10);
-
-                  // Convert to 24h if AM/PM
-                  if (ampm === 'PM' && hours < 12) hours += 12;
-                  if (ampm === 'AM' && hours === 12) hours = 0;
-
-                  // Build UTC date, then add CST offset
-                  const utcDate = new Date(Date.UTC(year, month - 1, day, hours, minutes));
-                  utcDate.setUTCHours(utcDate.getUTCHours() + CST_OFFSET_H);
-
-                  const newHours = utcDate.getUTCHours();
-                  const newMinutes = utcDate.getUTCMinutes();
-                  const newYear = utcDate.getUTCFullYear();
-                  const newMonth = utcDate.getUTCMonth() + 1;
-                  const newDay = utcDate.getUTCDate();
-
-                  const timeStr = String(newHours).padStart(2, '0') + ':' + String(newMinutes).padStart(2, '0');
-                  const dateStr = newYear + '\u5e74' + newMonth + '\u6708' + newDay + '\u65e5';
-                  const newText = timeStr + ' \u00b7 ' + dateStr;
-
-                  if (newText !== text) {
-                    el.textContent = newText;
-                  }
-                }
-              };
-              reformatTimestamps();
 
               stabilizeFooterLayout();
             }
