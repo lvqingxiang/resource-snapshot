@@ -2592,6 +2592,35 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                 return cell;
               };
 
+              const buildVideoGridCell = (video) => {
+                const cell = document.createElement('div');
+                cell.style.position = 'relative';
+                cell.style.overflow = 'hidden';
+                cell.style.minWidth = '0';
+                cell.style.minHeight = '0';
+                cell.style.width = '100%';
+                cell.style.height = '100%';
+                cell.style.background = '#000';
+
+                const canvas = document.createElement('canvas');
+                const width = video.videoWidth || Math.max(1, Math.round(video.getBoundingClientRect().width));
+                const height = video.videoHeight || Math.max(1, Math.round(video.getBoundingClientRect().height));
+                canvas.width = width;
+                canvas.height = height;
+                try {
+                  const context = canvas.getContext('2d');
+                  context?.drawImage(video, 0, 0, width, height);
+                } catch (error) {
+                }
+                canvas.style.width = '100%';
+                canvas.style.height = '100%';
+                canvas.style.objectFit = 'cover';
+                canvas.style.objectPosition = 'center center';
+                canvas.style.display = 'block';
+                cell.appendChild(canvas);
+                return cell;
+              };
+
               // Carousel parents keep a short landscape frame. After we rebuild a
               // taller 2x2 grid, unlock those ancestors or the bottom row gets
               // clipped into "forehead-only" peeks.
@@ -2653,12 +2682,65 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                 const images = slides
                   .map((slide) => slide.querySelector('img'))
                   .filter((img) => isMediaImage(img));
+                const videoSlides = [...carousel.children].filter(
+                  (child) => child.querySelector('video') || child.querySelector('[data-testid="videoComponent"]')
+                );
+
+                if (images.length > 0 && videoSlides.length > 0) {
+                  const mediaSlides = [...carousel.children]
+                    .map((slide) => {
+                      const video = slide.querySelector('video');
+                      if (video) {
+                        return { type: 'video', node: video };
+                      }
+                      const img = [...slide.querySelectorAll('img')].find((candidate) => isMediaImage(candidate));
+                      if (img) {
+                        return { type: 'image', node: img };
+                      }
+                      return null;
+                    })
+                    .filter(Boolean)
+                    .slice(0, 4);
+                  if (mediaSlides.length > 1) {
+                    const grid = document.createElement('div');
+                    grid.setAttribute(GRID_ATTR, 'true');
+                    grid.style.display = 'grid';
+                    grid.style.width = '100%';
+                    grid.style.gap = '2px';
+                    grid.style.borderRadius = '16px';
+                    grid.style.overflow = 'hidden';
+                    grid.style.background = '#000';
+                    if (mediaSlides.length === 2) {
+                      grid.style.gridTemplateColumns = '1fr 1fr';
+                      grid.style.gridTemplateRows = '1fr';
+                      grid.style.aspectRatio = '16 / 9';
+                    } else if (mediaSlides.length === 3) {
+                      grid.style.gridTemplateColumns = '1fr 1fr';
+                      grid.style.gridTemplateRows = '1fr 1fr';
+                      grid.style.aspectRatio = '4 / 3';
+                    } else {
+                      grid.style.gridTemplateColumns = '1fr 1fr';
+                      grid.style.gridTemplateRows = '1fr 1fr';
+                      grid.style.aspectRatio = '1 / 1';
+                    }
+
+                    mediaSlides.forEach((entry, index) => {
+                      const cell = entry.type === 'video'
+                        ? buildVideoGridCell(entry.node)
+                        : buildGridCell(entry.node);
+                      if (mediaSlides.length === 3 && index === 0) {
+                        cell.style.gridRow = '1 / span 2';
+                      }
+                      grid.appendChild(cell);
+                    });
+
+                    mountPhotoGrid(carousel, grid, mediaSlides.length);
+                    continue;
+                  }
+                }
 
                 if (images.length === 0) {
                   // Handle video carousels
-                  const videoSlides = [...carousel.children].filter(
-                    (child) => child.querySelector('video') || child.querySelector('[data-testid="videoComponent"]')
-                  );
                   if (videoSlides.length > 1) {
                     // Multi-cam: convert horizontal carousel to grid layout
                     const grid = document.createElement('div');
@@ -3128,6 +3210,10 @@ def _prepare_tweet_for_screenshot(tweet_card) -> None:
               }
 
               const hideVideoControlChrome = (video) => {
+                if (video.closest(`[${GRID_ATTR}]`)) {
+                  video.controls = false;
+                  return;
+                }
                 const findVideoPlayerRoot = (videoNode, cardRoot) => {
                   const explicit =
                     videoNode.closest('[data-testid="videoComponent"]') ||
@@ -3198,6 +3284,13 @@ def _prepare_tweet_for_screenshot(tweet_card) -> None:
               };
 
               const trimVideoContainer = (video) => {
+                if (video.closest(`[${GRID_ATTR}]`)) {
+                  video.style.width = '100%';
+                  video.style.height = '100%';
+                  video.style.objectFit = 'cover';
+                  video.style.background = 'transparent';
+                  return;
+                }
                 const rect = video.getBoundingClientRect();
                 if (rect.width < 1 || rect.height < 1) {
                   return;
