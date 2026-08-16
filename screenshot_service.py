@@ -3050,6 +3050,11 @@ def _prepare_tweet_for_screenshot(tweet_card) -> None:
               tweetRoot.style.maxWidth = '598px';
               tweetRoot.style.marginLeft = 'auto';
               tweetRoot.style.marginRight = 'auto';
+              // Do not clip the article by a guessed engagement/footer height.
+              // The timestamp/views and engagement row are part of the article.
+              tweetRoot.style.setProperty('height', 'auto', 'important');
+              tweetRoot.style.setProperty('max-height', 'none', 'important');
+              tweetRoot.style.setProperty('overflow-y', 'visible', 'important');
 
               const engagementSelector = [
                 '[data-testid="reply"]',
@@ -3138,6 +3143,30 @@ def _prepare_tweet_for_screenshot(tweet_card) -> None:
               }
 
               if (actionBar) {
+                const isEngagementControl = (node) => {
+                  if (!(node instanceof HTMLElement)) {
+                    return false;
+                  }
+
+                  if (
+                    node.matches(engagementSelector) ||
+                    node.closest(engagementSelector)
+                  ) {
+                    return true;
+                  }
+
+                  const label = (node.getAttribute('aria-label') || '').trim();
+                  return engagementAria.test(label);
+                };
+
+                const engagementCount = (node) => {
+                  if (!(node instanceof HTMLElement)) {
+                    return 0;
+                  }
+                  return [...node.querySelectorAll('button, a, [role="button"]')]
+                    .filter(isEngagementControl).length;
+                };
+
                 const containsFooterMetadata = (node) => {
                   if (!(node instanceof HTMLElement)) {
                     return false;
@@ -3149,34 +3178,47 @@ def _prepare_tweet_for_screenshot(tweet_card) -> None:
                   );
                 };
 
-                const removeFollowing = (container, pivot) => {
-                  let seen = false;
-                  for (const child of [...container.children]) {
-                    if (seen) {
-                      if (containsFooterMetadata(child)) {
+                // Only trim content after the bar when we are confident this is
+                // the real engagement row. This avoids deleting detached count
+                // wrappers used by newer X/Twitter layouts.
+                if (engagementCount(actionBar) >= 3) {
+                  const removeFollowing = (container, pivot) => {
+                    let seen = false;
+                    for (const child of [...container.children]) {
+                      if (seen) {
+                        if (containsFooterMetadata(child)) {
+                          continue;
+                        }
+
+                        // Preserve any detached reply/repost/like/bookmark/share
+                        // controls or count wrappers instead of removing them.
+                        if (engagementCount(child) > 0) {
+                          continue;
+                        }
+
+                        removeNode(child);
                         continue;
                       }
-                      removeNode(child);
-                      continue;
+                      if (child === pivot || child.contains(pivot)) {
+                        seen = true;
+                      }
                     }
-                    if (child === pivot || child.contains(pivot)) {
-                      seen = true;
-                    }
-                  }
-                };
+                  };
 
-                let pivot = actionBar;
-                while (pivot && pivot !== tweetRoot) {
-                  const parent = pivot.parentElement;
-                  if (!parent) {
-                    break;
+                  let pivot = actionBar;
+                  while (pivot && pivot !== tweetRoot) {
+                    const parent = pivot.parentElement;
+                    if (!parent) {
+                      break;
+                    }
+                    removeFollowing(parent, pivot);
+                    if (parent === tweetRoot) {
+                      break;
+                    }
+                    pivot = parent;
                   }
-                  removeFollowing(parent, pivot);
-                  if (parent === tweetRoot) {
-                    break;
-                  }
-                  pivot = parent;
                 }
+
               }
 
               // Final sweep in case the lock banner remounted or sat outside the
@@ -3728,39 +3770,229 @@ def _capture_detail_snapshot(
     *,
     tweet_id: str | None = None,
 ) -> None:
+    """Capture the target tweet article itself.
+
+    X's current detail DOM keeps timestamp/views and the reply/repost/like/bookmark
+    row inside <article>, while the reply composer is a sibling outside <article>.
+    Taking an element screenshot is therefore safer than guessing a clip bottom.
+    """
     _hide_non_primary_columns(page, tweet_id)
     _scroll_tweet_into_view(page, tweet_card, guest_mode=True)
+    _wait_for_tweet_assets(page, tweet_card)
 
-    clip = _compute_capture_clip(page, tweet_card)
-    if _ensure_viewport_can_fit_clip(page, clip):
-        _wait_for_tweet_assets(page, tweet_card)
-        page.wait_for_timeout(200)
-        _hide_non_primary_columns(page, tweet_id)
-        _scroll_tweet_into_view(page, tweet_card, guest_mode=True)
-        clip = _compute_capture_clip(page, tweet_card)
-        if _ensure_viewport_can_fit_clip(page, clip):
-            page.wait_for_timeout(200)
-            _hide_non_primary_columns(page, tweet_id)
-            _scroll_tweet_into_view(page, tweet_card, guest_mode=True)
-            clip = _compute_capture_clip(page, tweet_card)
-
-    # Final pass: replies can remount after viewport/layout changes.
+    # Viewport/layout changes can cause X to re-render parts of the footer.
+    page.wait_for_timeout(350)
     _hide_non_primary_columns(page, tweet_id)
-    clip = _compute_capture_clip(page, tweet_card) or clip
 
-    if clip:
-        page.screenshot(
+    try:
+        tweet_card.evaluate(
+            """
+            (root) => {
+              const article = root.matches('article')
+                ? root
+                : root.querySelector('article') || root;
+
+              if (article instanceof HTMLElement) {
+                article.style.setProperty('height', 'auto', 'important');
+                article.style.setProperty('max-height', 'none', 'important');
+                article.style.setProperty('overflow-y', 'visible', 'important');
+                article.style.setProperty('padding-bottom', '18px', 'important');
+                article.style.setProperty('box-sizing', 'border-box', 'important');
+              }
+
+              // X currently renders the engagement metrics inside a role=group
+              // at the very bottom of the article. Give that row breathing room
+              // so element screenshots do not shave off icon/number descenders.
+              const engagementGroup = [...article.querySelectorAll('[role="group"]')]
+                .find((node) =>
+                  node.querySelector(
+                    '[data-testid="reply"], [data-testid="retweet"], [data-testid="like"], [data-testid="bookmark"], [data-testid="removeBookmark"]'
+                  )
+                );
+              if (engagementGroup instanceof HTMLElement) {
+                engagementGroup.style.setProperty('margin-bottom', '10px', 'important');
+                engagementGroup.style.setProperty('padding-left', '12px', 'important');
+                engagementGroup.style.setProperty('padding-right', '12px', 'important');
+                engagementGroup.style.setProperty('box-sizing', 'border-box', 'important');
+                engagementGroup.style.setProperty('overflow', 'visible', 'important');
+              }
+
+              // Freeze each visible X video into a canvas after the requested
+              // frame has already been selected. This removes every player
+              // overlay (including ordinary div-based progress bars) without
+              // changing the captured frame.
+              for (const video of [...article.querySelectorAll('video')]) {
+                if (!(video instanceof HTMLVideoElement)) {
+                  continue;
+                }
+                const rect = video.getBoundingClientRect();
+                if (rect.width < 2 || rect.height < 2 || video.videoWidth < 2 || video.videoHeight < 2) {
+                  continue;
+                }
+
+                const player =
+                  video.closest('[data-testid="videoComponent"]') ||
+                  video.closest('[data-testid="videoPlayer"]') ||
+                  video.parentElement;
+                if (!(player instanceof HTMLElement)) {
+                  continue;
+                }
+
+                try {
+                  const canvas = document.createElement('canvas');
+                  canvas.width = video.videoWidth;
+                  canvas.height = video.videoHeight;
+                  const ctx = canvas.getContext('2d');
+                  if (!ctx) {
+                    continue;
+                  }
+                  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+                  canvas.setAttribute('data-resource-snapshot-video-frame', 'true');
+                  canvas.style.position = 'absolute';
+                  canvas.style.inset = '0';
+                  canvas.style.width = '100%';
+                  canvas.style.height = '100%';
+                  canvas.style.objectFit = 'cover';
+                  canvas.style.display = 'block';
+                  canvas.style.zIndex = '999';
+                  canvas.style.pointerEvents = 'none';
+                  canvas.style.background = '#000';
+
+                  player.style.position = 'relative';
+                  player.style.overflow = 'hidden';
+                  player.appendChild(canvas);
+
+                  // Hide the actual media element and every overlay under the
+                  // canvas. The canvas remains the only visible player layer.
+                  video.style.setProperty('visibility', 'hidden', 'important');
+                  for (const child of [...player.children]) {
+                    if (child === canvas) {
+                      continue;
+                    }
+                    if (child instanceof HTMLElement) {
+                      child.style.setProperty('visibility', 'hidden', 'important');
+                    }
+                  }
+                  canvas.style.setProperty('visibility', 'visible', 'important');
+                } catch (error) {
+                  // If drawing fails, fall back to aggressively hiding known UI.
+                  player.querySelectorAll(
+                    'button,[role="button"],[role="progressbar"],[role="slider"],input[type="range"]'
+                  ).forEach((node) => {
+                    if (node instanceof HTMLElement) {
+                      node.style.setProperty('display', 'none', 'important');
+                    }
+                  });
+                }
+              }
+
+              // Remove controls below the engagement row that are still inside
+              // the article ("Related", "View quotes"), but keep timestamp/views
+              // and all engagement metrics.
+              const junkPatterns = [
+                /^(相关|Related)$/i,
+                /^(查看引用|View quotes|See quotes)$/i,
+              ];
+
+              for (const node of [...article.querySelectorAll('button, a')]) {
+                if (!(node instanceof HTMLElement)) {
+                  continue;
+                }
+                const label = (node.innerText || node.textContent || '').trim();
+                if (!junkPatterns.some((pattern) => pattern.test(label))) {
+                  continue;
+                }
+
+                // These two controls normally share one bottom row.
+                let row = node.parentElement;
+                while (
+                  row instanceof HTMLElement &&
+                  row.parentElement instanceof HTMLElement &&
+                  row !== article
+                ) {
+                  const parentText = (row.parentElement.innerText || '').trim();
+                  if (
+                    parentText.length <= 80 &&
+                    (/相关|Related/i.test(parentText)) &&
+                    (/查看引用|View quotes|See quotes/i.test(parentText))
+                  ) {
+                    row = row.parentElement;
+                    break;
+                  }
+                  row = row.parentElement;
+                }
+
+                if (row instanceof HTMLElement && row !== article) {
+                  row.remove();
+                } else {
+                  node.remove();
+                }
+              }
+            }
+            """
+        )
+    except Exception:
+        pass
+
+    page.wait_for_timeout(150)
+
+    # Capture slightly outside the article itself. Element screenshots use the
+    # element's exact border box, which can visually shave rounded borders and
+    # edge controls. A small page-level margin preserves the complete outer card.
+    box = tweet_card.bounding_box()
+    if not box:
+        tweet_card.screenshot(
             path=str(path),
             animations="disabled",
-            clip=clip,
         )
         return
 
-    tweet_card.screenshot(
+    outer_margin = 10
+    viewport = page.viewport_size or {
+        "width": DEFAULT_VIEWPORT_WIDTH,
+        "height": DEFAULT_VIEWPORT_HEIGHT,
+    }
+
+    x = max(0, int(box["x"]) - outer_margin)
+    y = max(0, int(box["y"]) - outer_margin)
+    right = min(
+        int(viewport["width"]),
+        int(box["x"] + box["width"]) + outer_margin,
+    )
+    bottom = int(box["y"] + box["height"]) + outer_margin
+
+    required_height = bottom + CAPTURE_VIEWPORT_MARGIN
+    if required_height > int(viewport["height"]):
+        page.set_viewport_size(
+            {
+                "width": int(viewport["width"]),
+                "height": required_height,
+            }
+        )
+        page.wait_for_timeout(250)
+
+        # Re-read the box because viewport resize can reflow X.
+        box = tweet_card.bounding_box()
+        if box:
+            x = max(0, int(box["x"]) - outer_margin)
+            y = max(0, int(box["y"]) - outer_margin)
+            right = min(
+                int((page.viewport_size or viewport)["width"]),
+                int(box["x"] + box["width"]) + outer_margin,
+            )
+            bottom = int(box["y"] + box["height"]) + outer_margin
+
+    page.screenshot(
         path=str(path),
         animations="disabled",
+        clip={
+            "x": x,
+            "y": y,
+            "width": max(1, right - x),
+            "height": max(1, bottom - y),
+        },
     )
-
 
 def _build_output_name(detail_url: str, output_dir: Path) -> str:
     parsed = urlparse(detail_url)
