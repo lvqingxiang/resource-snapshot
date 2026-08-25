@@ -46,13 +46,13 @@ HLS_MASTER_ROUTE_RE = re.compile(
 )
 # Soft ceiling for headless Chromium: strip 4K / absurdly large amplify
 # streams (e.g. 2160x3840) that often fail with MEDIA_ELEMENT_ERROR.
-# Keep multiple ~1080p-and-below variants (not a single pinned URI) so
-# clearer frames are preferred when decodable. X's player may still hard-
-# fail on some 1080p profiles without ABR fallback — see demote steps.
-HLS_MAX_EDGE_PX = 1920
-HLS_MAX_AREA_PX = 1920 * 1080
+# Pin the best under-cap variant so X's ABR player cannot settle on a soft
+# lower rung. Decode failures reload with progressively lower ceilings.
+HLS_MAX_EDGE_PX = 2560
+HLS_MAX_AREA_PX = 2560 * 1440
 # Progressive ceilings used when the current playlist still won't decode.
 HLS_DEMOTE_STEPS: tuple[tuple[int, int], ...] = (
+    (1920, 1920 * 1080),
     (1280, 1280 * 720),
     (854, 854 * 480),
     (640, 640 * 360),
@@ -65,12 +65,7 @@ def _prefer_highest_hls_variant(
     max_edge: int | None = None,
     max_area: int | None = None,
 ) -> str:
-    """Rewrite an HLS master to keep multiple under-cap variants for ABR.
-
-    Drops streams above the soft ceiling while retaining several rungs
-    (sorted highest-first) so clearer frames are preferred when present.
-    Does not pin a single URI — lower rungs remain for player fallback.
-    """
+    """Rewrite an HLS master to pin the highest under-cap variant."""
     if "#EXT-X-STREAM-INF" not in body:
         return body
 
@@ -125,14 +120,15 @@ def _prefer_highest_hls_variant(
         for item in streams
         if item[0] > 0 and item[1] <= edge_cap and item[0] <= area_cap
     ]
-    # Prefer under-cap rungs; if none qualify, keep originals unchanged
-    # rather than inventing a single pinned URI.
+    # Prefer the clearest under-cap rung. Keeping multiple variants lets X's
+    # ABR settle on 720p even when a 1440p stream is available and decodable.
     candidates = under_cap or streams
     candidates = sorted(
         candidates,
         key=lambda item: (item[0], item[2]),
         reverse=True,
     )
+    candidates = candidates[:1]
     audio_groups = {item[5] for item in candidates if item[5]}
     if audio_groups:
         kept_media = [
@@ -2327,8 +2323,14 @@ def _prepare_video_frames(
               await ensureMetadata();
               // High-bitrate HLS needs a real decode pass before seeking,
               // otherwise Chromium often ends up with MEDIA_ERR_SRC_NOT_SUPPORTED.
-              // Portrait clips may only be ~720px wide, so don't require 640+.
-              const minDecodeWidth = 360;
+              // Use the rendered media size as the target so ABR does not settle
+              // for a tiny first rung that looks soft once captured.
+              const renderedRect = video.getBoundingClientRect();
+              const renderedShortEdge = Math.min(renderedRect.width || 0, renderedRect.height || 0);
+              const minDecodeWidth = Math.min(
+                960,
+                Math.max(360, Math.round(renderedShortEdge || 640)),
+              );
               await warmUp();
               await waitForDecodedFrame(minDecodeWidth, 8000);
               if (video.readyState < 2 || video.videoWidth < minDecodeWidth) {
