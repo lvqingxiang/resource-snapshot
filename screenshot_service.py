@@ -2882,6 +2882,64 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                 mountPhotoGrid(carousel, grid, images.length);
               }
 
+              // X's native multi-image grid is a static CSS grid (not a swipe carousel),
+              // so the snap-x/snap-mandatory detection above misses it. Without a rebuild,
+              // a 3-photo post renders as a 2x2 grid with an empty 4th cell (the white box).
+              // Walk every remaining photo container, group siblings, and rebuild a proper
+              // N-photo grid (2/3/4) so the layout always fills every cell.
+              const nativePhotoParents = new Map();
+              for (const photo of root.querySelectorAll('[data-testid="tweetPhoto"]')) {
+                if (!(photo instanceof HTMLElement)) continue;
+                if (photo.closest(`[${GRID_ATTR}]`)) continue;
+                const parent = photo.parentElement;
+                if (!parent || parent === root) continue;
+                if (parent.tagName === 'ARTICLE') continue;
+                if (!nativePhotoParents.has(parent)) nativePhotoParents.set(parent, []);
+                nativePhotoParents.get(parent).push(photo);
+              }
+              for (const [parent, photos] of nativePhotoParents) {
+                if (photos.length < 2 || photos.length > 4) continue;
+                const parentStyle = window.getComputedStyle(parent);
+                if (parentStyle.display !== 'grid') continue;
+                const images = photos
+                  .map((p) => p.querySelector('img'))
+                  .filter((img) => isMediaImage(img));
+                if (images.length < 2 || images.length > 4) continue;
+
+                const grid = document.createElement('div');
+                grid.setAttribute(GRID_ATTR, 'true');
+                grid.style.display = 'grid';
+                grid.style.width = '100%';
+                grid.style.gap = '2px';
+                grid.style.borderRadius = '16px';
+                grid.style.overflow = 'hidden';
+
+                const imageCount = images.length;
+                if (imageCount === 2) {
+                  grid.style.gridTemplateColumns = '1fr 1fr';
+                  grid.style.gridTemplateRows = '1fr';
+                } else if (imageCount === 3) {
+                  grid.style.gridTemplateColumns = '1fr 1fr';
+                  grid.style.gridTemplateRows = '1fr 1fr';
+                } else {
+                  grid.style.gridTemplateColumns = '1fr 1fr';
+                  grid.style.gridTemplateRows = '1fr 1fr';
+                }
+
+                const cells = images.map((img) => buildGridCell(img));
+                if (imageCount === 3) {
+                  cells[0].style.gridRow = '1 / span 2';
+                  cells[0].style.gridColumn = '1';
+                  cells[1].style.gridRow = '1';
+                  cells[1].style.gridColumn = '2';
+                  cells[2].style.gridRow = '2';
+                  cells[2].style.gridColumn = '2';
+                }
+                for (const cell of cells) grid.appendChild(cell);
+
+                mountPhotoGrid(parent, grid, imageCount);
+              }
+
               const tweetRoot = root.matches('article')
                 ? root
                 : root.querySelector('article') || root;
@@ -4261,6 +4319,17 @@ def _fetch_public_x_status(tweet_id: str) -> tuple[dict | None, str]:
 def _status_media_images(status: dict) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
+
+    def collect_url(url: object, bucket: list[str]) -> None:
+        if isinstance(url, str) and url and url not in bucket:
+            bucket.append(url)
+
+    def add_selected(urls: list[str]) -> None:
+        for url in urls:
+            if url not in seen:
+                seen.add(url)
+                out.append(url)
+
     nodes = [status]
     quote = status.get("quote") if isinstance(status, dict) else None
     if isinstance(quote, dict):
@@ -4269,14 +4338,13 @@ def _status_media_images(status: dict) -> list[str]:
         media = node.get("media") if isinstance(node, dict) else None
         if not isinstance(media, dict):
             continue
+        node_photos: list[str] = []
+        node_mosaics: list[str] = []
         photos = media.get("photos")
         if isinstance(photos, list):
             for item in photos:
                 if isinstance(item, dict):
-                    u = item.get("url")
-                    if isinstance(u, str) and u and u not in seen:
-                        seen.add(u)
-                        out.append(u)
+                    collect_url(item.get("url"), node_photos)
         all_media = media.get("all")
         if isinstance(all_media, list):
             for item in all_media:
@@ -4284,23 +4352,22 @@ def _status_media_images(status: dict) -> list[str]:
                     continue
                 typ = str(item.get("type") or "").lower()
                 u = item.get("url")
-                if typ in {"photo", "image"} and isinstance(u, str) and u and u not in seen:
-                    seen.add(u)
-                    out.append(u)
+                if typ in {"photo", "image"}:
+                    collect_url(u, node_photos)
                 elif typ == "mosaic_photo":
                     fmts = item.get("formats")
                     if isinstance(fmts, dict):
                         mu = fmts.get("jpeg") or fmts.get("webp")
-                        if isinstance(mu, str) and mu and mu not in seen:
-                            seen.add(mu)
-                            out.append(mu)
+                        collect_url(mu, node_mosaics)
         mosaic = media.get("mosaic")
         if isinstance(mosaic, dict):
             fmts = mosaic.get("formats")
             mu = (fmts.get("jpeg") or fmts.get("webp")) if isinstance(fmts, dict) else mosaic.get("url")
-            if isinstance(mu, str) and mu and mu not in seen:
-                seen.add(mu)
-                out.append(mu)
+            collect_url(mu, node_mosaics)
+        if node_photos:
+            add_selected(node_photos)
+        else:
+            add_selected(node_mosaics)
     return out
 
 
@@ -4481,7 +4548,9 @@ def _render_public_status_card(page, status: dict, tweet_id: str, *, dark_mode: 
       .handle{{color:{muted};font-size:15px;margin-top:2px;}}
       [data-testid="tweetText"]{{font-size:20px;line-height:1.42;white-space:pre-wrap;overflow-wrap:anywhere;margin:14px 0 10px;color:{fg};}}
       .media-grid{{display:grid;gap:2px;border-radius:16px;overflow:hidden;border:1px solid {border};margin-top:10px;background:{border};width:100%;}}
-      .media-grid.n1{{grid-template-columns:1fr}} .media-grid.n2{{grid-template-columns:1fr 1fr}} .media-grid.n3,.media-grid.n4{{grid-template-columns:1fr 1fr}}
+      .media-grid.n1{{grid-template-columns:1fr}} .media-grid.n2{{grid-template-columns:1fr 1fr}}
+      .media-grid.n3{{grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr}} .media-grid.n4{{grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr}}
+      .media-grid.n3 .media-cell:nth-child(1){{grid-row:1 / span 2}}
       .media-cell{{min-height:220px;max-height:720px;background:{border};overflow:hidden;}}
       .media-cell img{{width:100%;height:100%;max-height:720px;object-fit:cover;display:block;}}
       .media-grid.n1 .media-cell img{{height:auto;object-fit:contain;}}
