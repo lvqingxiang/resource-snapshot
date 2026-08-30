@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from dataclasses import dataclass
 from html import unescape
 import json
 from pathlib import Path
 import re
+import shutil
+import ssl
+import subprocess
 import time
 from typing import Callable
 from urllib.parse import urlencode, urlparse
@@ -935,7 +939,10 @@ def _wait_for_tweet_assets(page, tweet_card) -> None:
         page.wait_for_function(
             """
             (el) => {
-              const images = [...el.querySelectorAll('img')]
+              if (el.querySelector('video')) {
+                return true;
+              }
+              const images = [...el.querySelectorAll('.media-cell img')]
                 .filter((img) => img.offsetParent !== null);
               return images.length === 0 || images.every(
                 (img) => img.complete && img.naturalWidth > 0
@@ -988,6 +995,31 @@ def _wait_for_tweet_assets(page, tweet_card) -> None:
         pass
 
     page.wait_for_timeout(1200)
+
+
+def _wait_for_public_fallback_assets(page, tweet_card) -> None:
+    element = tweet_card.element_handle(timeout=3000)
+    if element is None:
+        return
+
+    try:
+        page.wait_for_function(
+            """
+            (el) => {
+              const images = [...el.querySelectorAll('img')]
+                .filter((img) => img.offsetParent !== null);
+              return images.length === 0 || images.every(
+                (img) => img.complete && img.naturalWidth > 0
+              );
+            }
+            """,
+            arg=element,
+            timeout=2500,
+        )
+    except PlaywrightTimeoutError:
+        pass
+
+    page.wait_for_timeout(120)
 
 
 # Regex: Hiragana, Katakana, Hangul (Japanese/Korean scripts)
@@ -2133,6 +2165,7 @@ def _prepare_video_frames(
               video.playsInline = true;
               video.preload = 'auto';
               video.controls = false;
+              const publicFallbackVideo = Boolean(video.closest('[data-public-api-media-grid]'));
 
               const playerRoot = findVideoPlayerRoot(video, cardRoot);
 
@@ -2197,10 +2230,10 @@ def _prepare_video_frames(
 
               const warmUp = async () => {
                 try {
-                  await playFor(1200);
+                  await playFor(publicFallbackVideo ? 350 : 1200);
                 } finally {
                   pauseVideo();
-                  await wait(180);
+                  await wait(publicFallbackVideo ? 80 : 180);
                 }
               };
 
@@ -2339,10 +2372,10 @@ def _prepare_video_frames(
                 Math.max(360, Math.round(renderedShortEdge || 640)),
               );
               await warmUp();
-              await waitForDecodedFrame(minDecodeWidth, 8000);
+              await waitForDecodedFrame(minDecodeWidth, publicFallbackVideo ? 2500 : 8000);
               if (video.readyState < 2 || video.videoWidth < minDecodeWidth) {
                 await warmUp();
-                await waitForDecodedFrame(minDecodeWidth, 8000);
+                await waitForDecodedFrame(minDecodeWidth, publicFallbackVideo ? 2500 : 8000);
               }
 
               // If 4K/unsupported streams still fail, leave the player alone —
@@ -2379,11 +2412,11 @@ def _prepare_video_frames(
                 await renderTargetFrame(desiredTime, duration);
               }
 
-              await waitForDecodedFrame(minDecodeWidth, 6000);
-              await wait(280);
+              await waitForDecodedFrame(minDecodeWidth, publicFallbackVideo ? 2000 : 6000);
+              await wait(publicFallbackVideo ? 120 : 280);
 
               hideVideoOverlays();
-              await wait(160);
+              await wait(publicFallbackVideo ? 60 : 160);
               return Number.isFinite(video.currentTime) ? video.currentTime : desiredTime;
               };
 
@@ -2495,6 +2528,37 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                   node.remove();
                 }
               };
+
+              const hasRenderableImage = (node) =>
+                Boolean(
+                  [...node.querySelectorAll('img')].some((img) => isMediaImage(img)),
+                );
+
+              const hasRenderableVideo = (node) =>
+                Boolean(
+                  [...node.querySelectorAll('video')].some((video) => {
+                    if (!(video instanceof HTMLVideoElement)) {
+                      return false;
+                    }
+                    const src = video.currentSrc || video.src || video.getAttribute('src') || '';
+                    const poster = video.poster || video.getAttribute('poster') || '';
+                    return Boolean(src || poster || video.videoWidth > 1 || video.videoHeight > 1);
+                  }),
+                );
+
+              for (const mediaRoot of [
+                ...root.querySelectorAll('[data-testid="tweetPhoto"], [data-testid="videoComponent"], [data-testid="videoPlayer"]'),
+              ]) {
+                if (!(mediaRoot instanceof HTMLElement)) {
+                  continue;
+                }
+                if (mediaRoot.closest(`[${GRID_ATTR}]`)) {
+                  continue;
+                }
+                if (!hasRenderableImage(mediaRoot) && !hasRenderableVideo(mediaRoot)) {
+                  removeNode(mediaRoot);
+                }
+              }
 
               for (const btn of root.querySelectorAll('button, [role="button"]')) {
                 const label = (btn.getAttribute('aria-label') || btn.textContent || '').trim();
@@ -2616,17 +2680,32 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                 const height = video.videoHeight || Math.max(1, Math.round(video.getBoundingClientRect().height));
                 canvas.width = width;
                 canvas.height = height;
+                let drewFrame = false;
                 try {
                   const context = canvas.getContext('2d');
-                  context?.drawImage(video, 0, 0, width, height);
+                  if (context && video.videoWidth > 1 && video.videoHeight > 1 && video.readyState >= 2) {
+                    context.drawImage(video, 0, 0, width, height);
+                    drewFrame = true;
+                  }
                 } catch (error) {
                 }
-                canvas.style.width = '100%';
-                canvas.style.height = '100%';
-                canvas.style.objectFit = 'cover';
-                canvas.style.objectPosition = 'center center';
-                canvas.style.display = 'block';
-                cell.appendChild(canvas);
+                if (drewFrame) {
+                  canvas.style.width = '100%';
+                  canvas.style.height = '100%';
+                  canvas.style.objectFit = 'cover';
+                  canvas.style.objectPosition = 'center center';
+                  canvas.style.display = 'block';
+                  cell.appendChild(canvas);
+                } else if (video.poster) {
+                  const poster = document.createElement('img');
+                  poster.src = video.poster;
+                  poster.style.width = '100%';
+                  poster.style.height = '100%';
+                  poster.style.objectFit = 'cover';
+                  poster.style.objectPosition = 'center center';
+                  poster.style.display = 'block';
+                  cell.appendChild(poster);
+                }
                 return cell;
               };
 
@@ -3836,6 +3915,7 @@ def _capture_detail_snapshot(
     path: Path,
     *,
     tweet_id: str | None = None,
+    public_api_fallback: bool = False,
 ) -> None:
     """Capture the target tweet article itself.
 
@@ -3845,7 +3925,8 @@ def _capture_detail_snapshot(
     """
     _hide_non_primary_columns(page, tweet_id)
     _scroll_tweet_into_view(page, tweet_card, guest_mode=True)
-    _wait_for_tweet_assets(page, tweet_card)
+    if not public_api_fallback:
+        _wait_for_tweet_assets(page, tweet_card)
 
     # Viewport/layout changes can cause X to re-render parts of the footer.
     page.wait_for_timeout(350)
@@ -4238,8 +4319,42 @@ def _open_capture_session(
 
 
 
-def _fetch_public_x_json(api_url: str, timeout: int = 20) -> dict | None:
+def _fetch_public_x_json(api_url: str, timeout: float = 6) -> dict | None:
     """Fetch public X mirror JSON without login."""
+    curl = shutil.which("curl")
+    if curl:
+        try:
+            completed = subprocess.run(
+                [
+                    curl,
+                    "--silent",
+                    "--show-error",
+                    "--location",
+                    "--insecure",
+                    "--connect-timeout",
+                    str(timeout),
+                    "--max-time",
+                    str(timeout),
+                    "--header",
+                    "User-Agent: resource-snapshot/1.0 anonymous-public-fallback",
+                    "--header",
+                    "Accept: application/json,text/plain,*/*",
+                    api_url,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout + 1,
+            )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout).strip()
+                print(f"[X public API] {api_url} -> curl exit {completed.returncode}: {detail}", flush=True)
+                return None
+            payload = json.loads(completed.stdout)
+            return payload if isinstance(payload, dict) else None
+        except Exception as exc:
+            print(f"[X public API] {api_url} -> {type(exc).__name__}: {exc}", flush=True)
+            return None
+
     request = Request(
         api_url,
         headers={
@@ -4248,7 +4363,8 @@ def _fetch_public_x_json(api_url: str, timeout: int = 20) -> dict | None:
         },
     )
     try:
-        with urlopen(request, timeout=timeout) as response:
+        context = ssl._create_unverified_context()
+        with urlopen(request, timeout=timeout, context=context) as response:
             payload = json.load(response)
         return payload if isinstance(payload, dict) else None
     except Exception as exc:
@@ -4297,26 +4413,101 @@ def _normalize_vxtwitter_status(data: dict) -> dict | None:
     }
 
 
-def _fetch_public_x_status(tweet_id: str) -> tuple[dict | None, str]:
-    """FxTwitter v2 -> legacy v1 -> VxTwitter, all anonymous."""
-    data = _fetch_public_x_json(f"https://api.fxtwitter.com/2/status/{tweet_id}")
-    if isinstance(data, dict):
+def _fetch_public_x_status(
+    tweet_id: str,
+    screen_name: str | None = None,
+    *,
+    timeout: float = 6,
+) -> tuple[dict | None, str]:
+    """Fetch anonymous mirror JSON; use the first compatible service to respond."""
+    candidates: list[tuple[str, str, Callable[[dict], dict | None]]] = []
+
+    def parse_fxtwitter_v2(data: dict) -> dict | None:
         status = data.get("status")
         if isinstance(status, dict) and data.get("code") in (None, 200):
-            return status, "fxtwitter_v2"
+            return status
+        return None
 
-    data = _fetch_public_x_json(f"https://api.fxtwitter.com/status/{tweet_id}")
-    if isinstance(data, dict) and isinstance(data.get("tweet"), dict):
-        return data["tweet"], "fxtwitter_v1"
+    def parse_fxtwitter_v1(data: dict) -> dict | None:
+        tweet = data.get("tweet")
+        return tweet if isinstance(tweet, dict) else None
 
-    data = _fetch_public_x_json(f"https://api.vxtwitter.com/Twitter/status/{tweet_id}")
-    status = _normalize_vxtwitter_status(data) if isinstance(data, dict) else None
-    if isinstance(status, dict):
-        return status, "vxtwitter"
+    def parse_vxtwitter(data: dict) -> dict | None:
+        return _normalize_vxtwitter_status(data)
+
+    if screen_name:
+        candidates.append(
+            (
+                f"https://api.fxtwitter.com/{screen_name}/status/{tweet_id}",
+                "fxtwitter_v1_user",
+                parse_fxtwitter_v1,
+            )
+        )
+    candidates.extend(
+        [
+            (f"https://api.fxtwitter.com/2/status/{tweet_id}", "fxtwitter_v2", parse_fxtwitter_v2),
+            (f"https://api.fxtwitter.com/status/{tweet_id}", "fxtwitter_v1", parse_fxtwitter_v1),
+            (f"https://api.vxtwitter.com/Twitter/status/{tweet_id}", "vxtwitter", parse_vxtwitter),
+        ]
+    )
+
+    executor = ThreadPoolExecutor(max_workers=len(candidates), thread_name_prefix="x-public-api")
+    futures = {
+        executor.submit(_fetch_public_x_json, api_url, timeout): (source, parser)
+        for api_url, source, parser in candidates
+    }
+    fallback_status: dict | None = None
+    fallback_source = ""
+    try:
+        for future in as_completed(futures, timeout=timeout + 1):
+            source, parser = futures[future]
+            try:
+                data = future.result()
+            except Exception:
+                continue
+            status = parser(data) if isinstance(data, dict) else None
+            if isinstance(status, dict):
+                if source == "vxtwitter":
+                    fallback_status = status
+                    fallback_source = source
+                    continue
+                return status, source
+    except FutureTimeoutError:
+        pass
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    if isinstance(fallback_status, dict):
+        return fallback_status, fallback_source
     return None, ""
 
 
-def _status_media_images(status: dict) -> list[str]:
+def _status_has_video_media(status: dict) -> bool:
+    nodes = [status]
+    quote = status.get("quote") if isinstance(status, dict) else None
+    if isinstance(quote, dict):
+        nodes.append(quote)
+
+    for node in nodes:
+        media = node.get("media") if isinstance(node, dict) else None
+        if not isinstance(media, dict):
+            continue
+        videos = media.get("videos")
+        if isinstance(videos, list) and videos:
+            return True
+        all_media = media.get("all")
+        if isinstance(all_media, list):
+            for item in all_media:
+                if not isinstance(item, dict):
+                    continue
+                typ = str(item.get("type") or "").lower()
+                url = str(item.get("url") or "").lower().split("?", 1)[0]
+                if typ in {"video", "gif", "animated_gif"} or "video.twimg.com" in url or url.endswith(".mp4"):
+                    return True
+    return False
+
+
+def _status_media_images(status: dict, *, include_quote: bool = False) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
 
@@ -4332,7 +4523,7 @@ def _status_media_images(status: dict) -> list[str]:
 
     nodes = [status]
     quote = status.get("quote") if isinstance(status, dict) else None
-    if isinstance(quote, dict):
+    if include_quote and isinstance(quote, dict):
         nodes.append(quote)
     for node in nodes:
         media = node.get("media") if isinstance(node, dict) else None
@@ -4371,6 +4562,74 @@ def _status_media_images(status: dict) -> list[str]:
     return out
 
 
+def _status_media_videos(status: dict) -> list[dict[str, object]]:
+    out: list[dict[str, object]] = []
+    seen: set[str] = set()
+
+    def choose_video_url(item: dict) -> str:
+        formats = item.get("formats")
+        best_mp4 = ""
+        best_score: tuple[int, int] | None = None
+        if isinstance(formats, list):
+            for fmt in formats:
+                if not isinstance(fmt, dict):
+                    continue
+                url = fmt.get("url")
+                if not isinstance(url, str) or not url:
+                    continue
+                container = str(fmt.get("container") or "").lower()
+                if container and container != "mp4":
+                    continue
+                if ".mp4" not in url.lower().split("?", 1)[0]:
+                    continue
+                match = re.search(r"/(?P<w>\d+)x(?P<h>\d+)/", url)
+                short_edge = min(int(match.group("w")), int(match.group("h"))) if match else 0
+                bitrate = int(fmt.get("bitrate") or 0)
+                target_penalty = abs(min(short_edge, 1080) - 720)
+                oversize_penalty = max(short_edge - 1080, 0) * 4
+                score = (target_penalty + oversize_penalty, -bitrate)
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_mp4 = url
+
+        direct = item.get("url")
+        if isinstance(direct, str) and direct and not best_mp4:
+            if ".mp4" in direct.lower().split("?", 1)[0]:
+                best_mp4 = direct
+        return best_mp4
+
+    def collect_from(node: dict, quoted: bool) -> None:
+        media = node.get("media") if isinstance(node, dict) else None
+        if not isinstance(media, dict):
+            return
+        for bucket in (media.get("videos"), media.get("all")):
+            if not isinstance(bucket, list):
+                continue
+            for item in bucket:
+                if not isinstance(item, dict):
+                    continue
+                url = choose_video_url(item)
+                if not url or url in seen:
+                    continue
+                typ = str(item.get("type") or "").lower()
+                if typ not in {"video", "gif", "animated_gif"} and "video.twimg.com" not in url:
+                    continue
+                seen.add(url)
+                out.append(
+                    {
+                        "url": url,
+                        "poster": item.get("thumbnail_url") or item.get("thumbnail"),
+                        "quoted": quoted,
+                    }
+                )
+
+    collect_from(status, False)
+    quote = status.get("quote") if isinstance(status, dict) else None
+    if isinstance(quote, dict):
+        collect_from(quote, True)
+    return out
+
+
 def _html_escape(value: object) -> str:
     import html as _html
     return _html.escape(str(value or ""), quote=True)
@@ -4403,6 +4662,7 @@ def _render_public_status_card(page, status: dict, tweet_id: str, *, dark_mode: 
     avatar = author.get("avatar_url") or author.get("avatar") or ""
     text = _status_text(status)
     images = _status_media_images(status)[:4]
+    videos = _status_media_videos(status)
     quote = status.get("quote") if isinstance(status.get("quote"), dict) else None
 
     bg = "#000000" if dark_mode else "#ffffff"
@@ -4466,7 +4726,20 @@ def _render_public_status_card(page, status: dict, tweet_id: str, *, dark_mode: 
             return ""
 
     image_html = ""
-    if images:
+    main_videos = [item for item in videos if not item.get("quoted")]
+    if main_videos:
+        cells = "".join(
+            (
+                '<div data-testid="videoPlayer" class="media-cell video-cell">'
+                f'<video src="{_html_escape(item.get("url"))}" '
+                f'poster="{_html_escape(item.get("poster"))}" '
+                'muted playsinline preload="auto"></video>'
+                '</div>'
+            )
+            for item in main_videos[:4]
+        )
+        image_html = f'<div class="media-grid n{min(len(main_videos), 4)}" data-public-api-media-grid="true">{cells}</div>'
+    elif images:
         cls = f"media-grid n{len(images)}"
         cells = "".join(
             f'<div data-testid="tweetPhoto" class="media-cell"><img src="{_html_escape(u)}" loading="eager"></div>'
@@ -4481,8 +4754,21 @@ def _render_public_status_card(page, status: dict, tweet_id: str, *, dark_mode: 
         qhandle = qa.get("screen_name") or ""
         qtext = _status_text(quote)
         qimgs = _status_media_images(quote)[:4]
+        qvideos = [item for item in videos if item.get("quoted")]
         qmedia = ""
-        if qimgs:
+        if qvideos:
+            qcells = "".join(
+                (
+                    '<div data-testid="videoPlayer" class="media-cell video-cell">'
+                    f'<video src="{_html_escape(item.get("url"))}" '
+                    f'poster="{_html_escape(item.get("poster"))}" '
+                    'muted playsinline preload="auto"></video>'
+                    '</div>'
+                )
+                for item in qvideos[:4]
+            )
+            qmedia = f'<div class="media-grid quote-media n{min(len(qvideos), 4)}" data-public-api-media-grid="true">{qcells}</div>'
+        elif qimgs:
             qcls = f"media-grid quote-media n{len(qimgs)}"
             qcells = "".join(
                 f'<div data-testid="tweetPhoto" class="media-cell"><img src="{_html_escape(u)}" loading="eager"></div>'
@@ -4554,6 +4840,8 @@ def _render_public_status_card(page, status: dict, tweet_id: str, *, dark_mode: 
       .media-cell{{min-height:220px;max-height:720px;background:{border};overflow:hidden;}}
       .media-cell img{{width:100%;height:100%;max-height:720px;object-fit:cover;display:block;}}
       .media-grid.n1 .media-cell img{{height:auto;object-fit:contain;}}
+      .video-cell{{display:flex;align-items:center;justify-content:center;aspect-ratio:1 / 1;}}
+      .video-cell video{{width:100%;height:100%;object-fit:cover;display:block;background:#000;}}
       .quote{{border:1px solid {border};border-radius:14px;padding:12px;margin-top:12px;overflow:hidden;}}
       .quote-user{{font-size:15px;line-height:1.3}} .quote-user span{{color:{muted}}}
       .quote-text{{font-size:15px!important;line-height:1.45!important;margin:8px 0!important;}}
@@ -4582,20 +4870,38 @@ def _render_public_status_card(page, status: dict, tweet_id: str, *, dark_mode: 
         </div>
       </article></main>
     </body></html>'''
-    page.set_content(html, wait_until="load")
-    page.wait_for_timeout(1200)
+    page.set_content(html, wait_until="domcontentloaded")
+    page.wait_for_timeout(100)
     card = page.locator(f'article[data-tweet-id="{tweet_id}"]').first
     card.wait_for(state="visible", timeout=5000)
     return card
 
 
-def _load_public_fallback_tweet_card(page, tweet_id: str, *, dark_mode: bool):
-    status, source = _fetch_public_x_status(tweet_id)
+def _load_public_fallback_tweet_card(
+    page,
+    tweet_id: str,
+    screen_name: str | None = None,
+    *,
+    dark_mode: bool,
+    status: dict | None = None,
+    source: str = "",
+    timeout: float = 6,
+):
+    if not isinstance(status, dict):
+        status, source = _fetch_public_x_status(tweet_id, screen_name=screen_name, timeout=timeout)
     if not isinstance(status, dict):
         return None, "", ""
     print(f"[X public API] {source} 命中，使用匿名数据兼容截图", flush=True)
     card = _render_public_status_card(page, status, tweet_id, dark_mode=dark_mode, source=source)
     return card, f"public-api://{source}/status/{tweet_id}", "public_api_fallback"
+
+
+def _prepare_public_fallback_card(page, tweet_id: str, public_card, *, dark_mode: bool):
+    _expand_tweet_text(public_card)
+    page.wait_for_timeout(100)
+    page.add_style_tag(content=_detail_capture_css(dark_mode))
+    _hide_non_primary_columns(page, tweet_id)
+    return public_card
 
 
 def _load_tweet_card(
@@ -4609,6 +4915,27 @@ def _load_tweet_card(
     guest_mode: bool = False,
 ):
     last_error: Exception | None = None
+    public_status: dict | None = None
+    public_source = ""
+
+    if guest_mode:
+        public_status, public_source = _fetch_public_x_status(tweet_id, screen_name=screen_name, timeout=3)
+        if isinstance(public_status, dict):
+            try:
+                public_card, public_url, public_mode = _load_public_fallback_tweet_card(
+                    page,
+                    tweet_id,
+                    screen_name,
+                    dark_mode=dark_mode,
+                    status=public_status,
+                    source=public_source,
+                    timeout=3,
+                )
+                if public_card is not None:
+                    _prepare_public_fallback_card(page, tweet_id, public_card, dark_mode=dark_mode)
+                    return public_card, public_url, public_mode
+            except Exception as exc:
+                last_error = exc
 
     for candidate_url, mode in _candidate_urls(normalized_url, screen_name, tweet_id):
         try:
@@ -4649,18 +4976,16 @@ def _load_tweet_card(
     # of forcing the user to log in.
     try:
         public_card, public_url, public_mode = _load_public_fallback_tweet_card(
-            page, tweet_id, dark_mode=dark_mode
+            page,
+            tweet_id,
+            screen_name,
+            dark_mode=dark_mode,
+            status=public_status,
+            source=public_source,
+            timeout=6,
         )
         if public_card is not None:
-            # page.set_content() used by the public fallback replaces the document,
-            # so styles previously injected on an X detail page are gone. Re-apply
-            # the exact same capture CSS/cleanup path as a normal X tweet before
-            # returning the card. This keeps translation typography, spacing, media
-            # layout, timestamp/views and engagement footer consistent.
-            _expand_tweet_text(public_card)
-            page.wait_for_timeout(100)
-            page.add_style_tag(content=_detail_capture_css(dark_mode))
-            _hide_non_primary_columns(page, tweet_id)
+            _prepare_public_fallback_card(page, tweet_id, public_card, dark_mode=dark_mode)
             return public_card, public_url, public_mode
     except Exception as exc:
         last_error = exc
@@ -4710,7 +5035,8 @@ def preview_tweet_translations(
                 wait_timeout_ms=wait_timeout_ms,
                 guest_mode=guest_mode,
             )
-            _wait_for_tweet_assets(page, tweet_card)
+            if capture_mode != "public_api_fallback":
+                _wait_for_tweet_assets(page, tweet_card)
 
             text_blocks = _collect_translation_text_blocks(tweet_card, used_url or normalized_url)
             items = tuple(
@@ -4797,7 +5123,10 @@ def capture_tweet_page(
                     wait_timeout_ms=wait_timeout_ms,
                     guest_mode=guest_mode,
                 )
-                _wait_for_tweet_assets(page, tweet_card)
+                if capture_mode == "public_api_fallback":
+                    _wait_for_public_fallback_assets(page, tweet_card)
+                else:
+                    _wait_for_tweet_assets(page, tweet_card)
                 _expand_tweet_text(tweet_card)
                 page.wait_for_timeout(200)
                 if translate_body:
@@ -4828,6 +5157,7 @@ def capture_tweet_page(
                 tweet_card,
                 saved_to,
                 tweet_id=tweet_id,
+                public_api_fallback=capture_mode == "public_api_fallback",
             )
         finally:
             session.close()
