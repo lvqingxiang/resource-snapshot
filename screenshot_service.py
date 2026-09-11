@@ -2765,6 +2765,69 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                 }
               };
 
+              const cellFromMediaEntry = (entry) => {
+                if (entry.type === 'video') {
+                  const video = entry.node instanceof HTMLVideoElement
+                    ? entry.node
+                    : (entry.node instanceof Element ? entry.node.querySelector('video') : null);
+                  if (video instanceof HTMLVideoElement) {
+                    return buildVideoGridCell(video);
+                  }
+                  const poster = entry.node instanceof Element
+                    ? [...entry.node.querySelectorAll('img')].find((img) => isMediaImage(img))
+                    : null;
+                  if (poster) {
+                    return buildGridCell(poster);
+                  }
+                  const empty = document.createElement('div');
+                  empty.style.background = '#000';
+                  empty.style.width = '100%';
+                  empty.style.height = '100%';
+                  return empty;
+                }
+                return buildGridCell(entry.node);
+              };
+
+              const buildMixedMediaGrid = (entries) => {
+                const grid = document.createElement('div');
+                grid.setAttribute(GRID_ATTR, 'true');
+                grid.style.display = 'grid';
+                grid.style.width = '100%';
+                grid.style.gap = '2px';
+                grid.style.borderRadius = '16px';
+                grid.style.overflow = 'hidden';
+                grid.style.background = '#000';
+                const count = Math.min(entries.length, 4);
+                if (count === 2) {
+                  grid.style.gridTemplateColumns = '1fr 1fr';
+                  grid.style.gridTemplateRows = '1fr';
+                  grid.style.aspectRatio = '16 / 9';
+                } else if (count === 3) {
+                  grid.style.gridTemplateColumns = '1fr 1fr';
+                  grid.style.gridTemplateRows = '1fr 1fr';
+                  grid.style.aspectRatio = '4 / 3';
+                } else {
+                  grid.style.gridTemplateColumns = '1fr 1fr';
+                  grid.style.gridTemplateRows = '1fr 1fr';
+                  grid.style.aspectRatio = '1 / 1';
+                }
+                entries.slice(0, 4).forEach((entry, index) => {
+                  const cell = cellFromMediaEntry(entry);
+                  if (count === 3 && index === 0) {
+                    cell.style.gridRow = '1 / span 2';
+                    cell.style.gridColumn = '1';
+                  } else if (count === 3 && index === 1) {
+                    cell.style.gridRow = '1';
+                    cell.style.gridColumn = '2';
+                  } else if (count === 3 && index === 2) {
+                    cell.style.gridRow = '2';
+                    cell.style.gridColumn = '2';
+                  }
+                  grid.appendChild(cell);
+                });
+                return grid;
+              };
+
               for (const carousel of carousels) {
                 const slides = [...carousel.children].filter((child) => child.querySelector('img'));
                 const images = slides
@@ -2790,38 +2853,7 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                     .filter(Boolean)
                     .slice(0, 4);
                   if (mediaSlides.length > 1) {
-                    const grid = document.createElement('div');
-                    grid.setAttribute(GRID_ATTR, 'true');
-                    grid.style.display = 'grid';
-                    grid.style.width = '100%';
-                    grid.style.gap = '2px';
-                    grid.style.borderRadius = '16px';
-                    grid.style.overflow = 'hidden';
-                    grid.style.background = '#000';
-                    if (mediaSlides.length === 2) {
-                      grid.style.gridTemplateColumns = '1fr 1fr';
-                      grid.style.gridTemplateRows = '1fr';
-                      grid.style.aspectRatio = '16 / 9';
-                    } else if (mediaSlides.length === 3) {
-                      grid.style.gridTemplateColumns = '1fr 1fr';
-                      grid.style.gridTemplateRows = '1fr 1fr';
-                      grid.style.aspectRatio = '4 / 3';
-                    } else {
-                      grid.style.gridTemplateColumns = '1fr 1fr';
-                      grid.style.gridTemplateRows = '1fr 1fr';
-                      grid.style.aspectRatio = '1 / 1';
-                    }
-
-                    mediaSlides.forEach((entry, index) => {
-                      const cell = entry.type === 'video'
-                        ? buildVideoGridCell(entry.node)
-                        : buildGridCell(entry.node);
-                      if (mediaSlides.length === 3 && index === 0) {
-                        cell.style.gridRow = '1 / span 2';
-                      }
-                      grid.appendChild(cell);
-                    });
-
+                    const grid = buildMixedMediaGrid(mediaSlides);
                     mountPhotoGrid(carousel, grid, mediaSlides.length);
                     continue;
                   }
@@ -2964,59 +2996,48 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
               // X's native multi-image grid is a static CSS grid (not a swipe carousel),
               // so the snap-x/snap-mandatory detection above misses it. Without a rebuild,
               // a 3-photo post renders as a 2x2 grid with an empty 4th cell (the white box).
-              // Walk every remaining photo container, group siblings, and rebuild a proper
-              // N-photo grid (2/3/4) so the layout always fills every cell.
-              const nativePhotoParents = new Map();
-              for (const photo of root.querySelectorAll('[data-testid="tweetPhoto"]')) {
-                if (!(photo instanceof HTMLElement)) continue;
-                if (photo.closest(`[${GRID_ATTR}]`)) continue;
-                const parent = photo.parentElement;
+              // Mixed photo+video posts have the same parent grid; a photo-only rebuild
+              // would drop the video. Walk remaining photo/video siblings and rebuild a
+              // proper N-item grid (2/3/4). Skip public-API fallback grids — they are
+              // already laid out, and a photo-only pass would delete their video cell.
+              const nativeMediaParents = new Map();
+              for (const media of root.querySelectorAll(
+                '[data-testid="tweetPhoto"], [data-testid="videoPlayer"], [data-testid="videoComponent"]',
+              )) {
+                if (!(media instanceof HTMLElement)) continue;
+                if (media.closest(`[${GRID_ATTR}]`)) continue;
+                if (media.closest('[data-public-api-media-grid]')) continue;
+                if (
+                  media.getAttribute('data-testid') === 'videoComponent' &&
+                  media.closest('[data-testid="videoPlayer"]')
+                ) {
+                  continue;
+                }
+                const parent = media.parentElement;
                 if (!parent || parent === root) continue;
                 if (parent.tagName === 'ARTICLE') continue;
-                if (!nativePhotoParents.has(parent)) nativePhotoParents.set(parent, []);
-                nativePhotoParents.get(parent).push(photo);
+                if (parent.hasAttribute('data-public-api-media-grid')) continue;
+                if (!nativeMediaParents.has(parent)) nativeMediaParents.set(parent, []);
+                nativeMediaParents.get(parent).push(media);
               }
-              for (const [parent, photos] of nativePhotoParents) {
-                if (photos.length < 2 || photos.length > 4) continue;
+              for (const [parent, mediaNodes] of nativeMediaParents) {
+                if (mediaNodes.length < 2 || mediaNodes.length > 4) continue;
                 const parentStyle = window.getComputedStyle(parent);
-                if (parentStyle.display !== 'grid') continue;
-                const images = photos
-                  .map((p) => p.querySelector('img'))
-                  .filter((img) => isMediaImage(img));
-                if (images.length < 2 || images.length > 4) continue;
+                if (parentStyle.display !== 'grid' && parentStyle.display !== 'inline-grid') continue;
+                const entries = mediaNodes
+                  .map((node) => {
+                    const testid = node.getAttribute('data-testid');
+                    if (testid === 'videoPlayer' || testid === 'videoComponent') {
+                      return { type: 'video', node };
+                    }
+                    const img = node.querySelector('img');
+                    return img && isMediaImage(img) ? { type: 'image', node: img } : null;
+                  })
+                  .filter(Boolean);
+                if (entries.length < 2 || entries.length > 4) continue;
 
-                const grid = document.createElement('div');
-                grid.setAttribute(GRID_ATTR, 'true');
-                grid.style.display = 'grid';
-                grid.style.width = '100%';
-                grid.style.gap = '2px';
-                grid.style.borderRadius = '16px';
-                grid.style.overflow = 'hidden';
-
-                const imageCount = images.length;
-                if (imageCount === 2) {
-                  grid.style.gridTemplateColumns = '1fr 1fr';
-                  grid.style.gridTemplateRows = '1fr';
-                } else if (imageCount === 3) {
-                  grid.style.gridTemplateColumns = '1fr 1fr';
-                  grid.style.gridTemplateRows = '1fr 1fr';
-                } else {
-                  grid.style.gridTemplateColumns = '1fr 1fr';
-                  grid.style.gridTemplateRows = '1fr 1fr';
-                }
-
-                const cells = images.map((img) => buildGridCell(img));
-                if (imageCount === 3) {
-                  cells[0].style.gridRow = '1 / span 2';
-                  cells[0].style.gridColumn = '1';
-                  cells[1].style.gridRow = '1';
-                  cells[1].style.gridColumn = '2';
-                  cells[2].style.gridRow = '2';
-                  cells[2].style.gridColumn = '2';
-                }
-                for (const cell of cells) grid.appendChild(cell);
-
-                mountPhotoGrid(parent, grid, imageCount);
+                const grid = buildMixedMediaGrid(entries);
+                mountPhotoGrid(parent, grid, entries.length);
               }
 
               const tweetRoot = root.matches('article')
@@ -4507,127 +4528,136 @@ def _status_has_video_media(status: dict) -> bool:
     return False
 
 
-def _status_media_images(status: dict, *, include_quote: bool = False) -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
-
-    def collect_url(url: object, bucket: list[str]) -> None:
-        if isinstance(url, str) and url and url not in bucket:
-            bucket.append(url)
-
-    def add_selected(urls: list[str]) -> None:
-        for url in urls:
-            if url not in seen:
-                seen.add(url)
-                out.append(url)
-
-    nodes = [status]
-    quote = status.get("quote") if isinstance(status, dict) else None
-    if include_quote and isinstance(quote, dict):
-        nodes.append(quote)
-    for node in nodes:
-        media = node.get("media") if isinstance(node, dict) else None
-        if not isinstance(media, dict):
-            continue
-        node_photos: list[str] = []
-        node_mosaics: list[str] = []
-        photos = media.get("photos")
-        if isinstance(photos, list):
-            for item in photos:
-                if isinstance(item, dict):
-                    collect_url(item.get("url"), node_photos)
-        all_media = media.get("all")
-        if isinstance(all_media, list):
-            for item in all_media:
-                if not isinstance(item, dict):
-                    continue
-                typ = str(item.get("type") or "").lower()
-                u = item.get("url")
-                if typ in {"photo", "image"}:
-                    collect_url(u, node_photos)
-                elif typ == "mosaic_photo":
-                    fmts = item.get("formats")
-                    if isinstance(fmts, dict):
-                        mu = fmts.get("jpeg") or fmts.get("webp")
-                        collect_url(mu, node_mosaics)
-        mosaic = media.get("mosaic")
-        if isinstance(mosaic, dict):
-            fmts = mosaic.get("formats")
-            mu = (fmts.get("jpeg") or fmts.get("webp")) if isinstance(fmts, dict) else mosaic.get("url")
-            collect_url(mu, node_mosaics)
-        if node_photos:
-            add_selected(node_photos)
-        else:
-            add_selected(node_mosaics)
-    return out
+def _media_item_is_video(item: dict) -> bool:
+    typ = str(item.get("type") or "").lower()
+    url = str(item.get("url") or "").lower().split("?", 1)[0]
+    return typ in {"video", "gif", "animated_gif"} or "video.twimg.com" in url or url.endswith(".mp4")
 
 
-def _status_media_videos(status: dict) -> list[dict[str, object]]:
-    out: list[dict[str, object]] = []
-    seen: set[str] = set()
-
-    def choose_video_url(item: dict) -> str:
-        formats = item.get("formats")
-        best_mp4 = ""
-        best_score: tuple[int, int] | None = None
-        if isinstance(formats, list):
-            for fmt in formats:
-                if not isinstance(fmt, dict):
-                    continue
-                url = fmt.get("url")
-                if not isinstance(url, str) or not url:
-                    continue
-                container = str(fmt.get("container") or "").lower()
-                if container and container != "mp4":
-                    continue
-                if ".mp4" not in url.lower().split("?", 1)[0]:
-                    continue
-                match = re.search(r"/(?P<w>\d+)x(?P<h>\d+)/", url)
-                short_edge = min(int(match.group("w")), int(match.group("h"))) if match else 0
-                bitrate = int(fmt.get("bitrate") or 0)
-                target_penalty = abs(min(short_edge, 1080) - 720)
-                oversize_penalty = max(short_edge - 1080, 0) * 4
-                score = (target_penalty + oversize_penalty, -bitrate)
-                if best_score is None or score < best_score:
-                    best_score = score
-                    best_mp4 = url
-
-        direct = item.get("url")
-        if isinstance(direct, str) and direct and not best_mp4:
-            if ".mp4" in direct.lower().split("?", 1)[0]:
-                best_mp4 = direct
-        return best_mp4
-
-    def collect_from(node: dict, quoted: bool) -> None:
-        media = node.get("media") if isinstance(node, dict) else None
-        if not isinstance(media, dict):
-            return
-        for bucket in (media.get("videos"), media.get("all")):
-            if not isinstance(bucket, list):
+def _choose_status_video_url(item: dict) -> str:
+    formats = item.get("formats")
+    best_mp4 = ""
+    best_score: tuple[int, int] | None = None
+    if isinstance(formats, list):
+        for fmt in formats:
+            if not isinstance(fmt, dict):
                 continue
-            for item in bucket:
-                if not isinstance(item, dict):
-                    continue
-                url = choose_video_url(item)
-                if not url or url in seen:
-                    continue
-                typ = str(item.get("type") or "").lower()
-                if typ not in {"video", "gif", "animated_gif"} and "video.twimg.com" not in url:
-                    continue
-                seen.add(url)
-                out.append(
-                    {
-                        "url": url,
-                        "poster": item.get("thumbnail_url") or item.get("thumbnail"),
-                        "quoted": quoted,
-                    }
-                )
+            url = fmt.get("url")
+            if not isinstance(url, str) or not url:
+                continue
+            container = str(fmt.get("container") or "").lower()
+            if container and container != "mp4":
+                continue
+            if ".mp4" not in url.lower().split("?", 1)[0]:
+                continue
+            match = re.search(r"/(?P<w>\d+)x(?P<h>\d+)/", url)
+            short_edge = min(int(match.group("w")), int(match.group("h"))) if match else 0
+            bitrate = int(fmt.get("bitrate") or 0)
+            target_penalty = abs(min(short_edge, 1080) - 720)
+            oversize_penalty = max(short_edge - 1080, 0) * 4
+            score = (target_penalty + oversize_penalty, -bitrate)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_mp4 = url
 
-    collect_from(status, False)
-    quote = status.get("quote") if isinstance(status, dict) else None
-    if isinstance(quote, dict):
-        collect_from(quote, True)
-    return out
+    direct = item.get("url")
+    if isinstance(direct, str) and direct and not best_mp4:
+        if ".mp4" in direct.lower().split("?", 1)[0]:
+            best_mp4 = direct
+    return best_mp4
+
+
+def _collect_node_media_items(node: dict) -> list[dict[str, object]]:
+    """Return photos and videos for one status/quote node, preserving API order."""
+    media = node.get("media") if isinstance(node, dict) else None
+    if not isinstance(media, dict):
+        return []
+
+    items: list[dict[str, object]] = []
+    seen: set[str] = set()
+
+    def append_photo(url: object) -> None:
+        if isinstance(url, str) and url and url not in seen:
+            seen.add(url)
+            items.append({"type": "photo", "url": url})
+
+    def append_video(item: dict) -> None:
+        url = _choose_status_video_url(item)
+        if not url or url in seen:
+            return
+        if not _media_item_is_video({"type": item.get("type"), "url": url}):
+            return
+        seen.add(url)
+        items.append(
+            {
+                "type": "video",
+                "url": url,
+                "poster": item.get("thumbnail_url") or item.get("thumbnail") or "",
+            }
+        )
+
+    all_media = media.get("all")
+    if isinstance(all_media, list) and all_media:
+        for item in all_media:
+            if not isinstance(item, dict):
+                continue
+            if _media_item_is_video(item):
+                append_video(item)
+            else:
+                typ = str(item.get("type") or "").lower()
+                url = item.get("url")
+                if typ in {"photo", "image"} or (isinstance(url, str) and "twimg.com/media" in url):
+                    append_photo(url)
+        if items:
+            return items
+
+    photos = media.get("photos")
+    if isinstance(photos, list):
+        for item in photos:
+            if isinstance(item, dict):
+                append_photo(item.get("url"))
+            elif isinstance(item, str):
+                append_photo(item)
+    videos = media.get("videos")
+    if isinstance(videos, list):
+        for item in videos:
+            if isinstance(item, dict):
+                append_video(item)
+    if items:
+        return items
+
+    mosaic = media.get("mosaic")
+    if isinstance(mosaic, dict):
+        fmts = mosaic.get("formats")
+        mu = (fmts.get("jpeg") or fmts.get("webp")) if isinstance(fmts, dict) else mosaic.get("url")
+        append_photo(mu)
+    return items
+
+
+def _public_media_cell_html(item: dict[str, object]) -> str:
+    if item.get("type") == "video":
+        return (
+            '<div data-testid="videoPlayer" class="media-cell video-cell">'
+            f'<video src="{_html_escape(item.get("url"))}" '
+            f'poster="{_html_escape(item.get("poster"))}" '
+            'muted playsinline preload="auto"></video>'
+            "</div>"
+        )
+    return (
+        f'<div data-testid="tweetPhoto" class="media-cell">'
+        f'<img src="{_html_escape(item.get("url"))}" loading="eager"></div>'
+    )
+
+
+def _public_media_grid_html(items: list[dict[str, object]], extra_class: str = "") -> str:
+    chosen = items[:4]
+    if not chosen:
+        return ""
+    cls = f"media-grid n{len(chosen)}"
+    if extra_class:
+        cls += f" {extra_class}"
+    cells = "".join(_public_media_cell_html(item) for item in chosen)
+    return f'<div class="{cls}" data-public-api-media-grid="true">{cells}</div>'
 
 
 def _html_escape(value: object) -> str:
@@ -4661,8 +4691,7 @@ def _render_public_status_card(page, status: dict, tweet_id: str, *, dark_mode: 
     handle = author.get("screen_name") or ""
     avatar = author.get("avatar_url") or author.get("avatar") or ""
     text = _status_text(status)
-    images = _status_media_images(status)[:4]
-    videos = _status_media_videos(status)
+    media_items = _collect_node_media_items(status)
     quote = status.get("quote") if isinstance(status.get("quote"), dict) else None
 
     bg = "#000000" if dark_mode else "#ffffff"
@@ -4725,27 +4754,7 @@ def _render_public_status_card(page, status: dict, tweet_id: str, *, dark_mode: 
         except Exception:
             return ""
 
-    image_html = ""
-    main_videos = [item for item in videos if not item.get("quoted")]
-    if main_videos:
-        cells = "".join(
-            (
-                '<div data-testid="videoPlayer" class="media-cell video-cell">'
-                f'<video src="{_html_escape(item.get("url"))}" '
-                f'poster="{_html_escape(item.get("poster"))}" '
-                'muted playsinline preload="auto"></video>'
-                '</div>'
-            )
-            for item in main_videos[:4]
-        )
-        image_html = f'<div class="media-grid n{min(len(main_videos), 4)}" data-public-api-media-grid="true">{cells}</div>'
-    elif images:
-        cls = f"media-grid n{len(images)}"
-        cells = "".join(
-            f'<div data-testid="tweetPhoto" class="media-cell"><img src="{_html_escape(u)}" loading="eager"></div>'
-            for u in images
-        )
-        image_html = f'<div class="{cls}" data-public-api-media-grid="true">{cells}</div>'
+    image_html = _public_media_grid_html(media_items)
 
     quote_html = ""
     if quote:
@@ -4753,28 +4762,7 @@ def _render_public_status_card(page, status: dict, tweet_id: str, *, dark_mode: 
         qname = qa.get("name") or qa.get("screen_name") or ""
         qhandle = qa.get("screen_name") or ""
         qtext = _status_text(quote)
-        qimgs = _status_media_images(quote)[:4]
-        qvideos = [item for item in videos if item.get("quoted")]
-        qmedia = ""
-        if qvideos:
-            qcells = "".join(
-                (
-                    '<div data-testid="videoPlayer" class="media-cell video-cell">'
-                    f'<video src="{_html_escape(item.get("url"))}" '
-                    f'poster="{_html_escape(item.get("poster"))}" '
-                    'muted playsinline preload="auto"></video>'
-                    '</div>'
-                )
-                for item in qvideos[:4]
-            )
-            qmedia = f'<div class="media-grid quote-media n{min(len(qvideos), 4)}" data-public-api-media-grid="true">{qcells}</div>'
-        elif qimgs:
-            qcls = f"media-grid quote-media n{len(qimgs)}"
-            qcells = "".join(
-                f'<div data-testid="tweetPhoto" class="media-cell"><img src="{_html_escape(u)}" loading="eager"></div>'
-                for u in qimgs
-            )
-            qmedia = f'<div class="{qcls}" data-public-api-media-grid="true">{qcells}</div>'
+        qmedia = _public_media_grid_html(_collect_node_media_items(quote), extra_class="quote-media")
         quote_html = (
             '<div data-testid="quoteTweet" class="quote">'
             f'<div data-testid="User-Name" class="quote-user"><b>{_html_escape(qname)}</b> <span>@{_html_escape(qhandle)}</span></div>'
@@ -4834,13 +4822,15 @@ def _render_public_status_card(page, status: dict, tweet_id: str, *, dark_mode: 
       .handle{{color:{muted};font-size:15px;margin-top:2px;}}
       [data-testid="tweetText"]{{font-size:20px;line-height:1.42;white-space:pre-wrap;overflow-wrap:anywhere;margin:14px 0 10px;color:{fg};}}
       .media-grid{{display:grid;gap:2px;border-radius:16px;overflow:hidden;border:1px solid {border};margin-top:10px;background:{border};width:100%;}}
-      .media-grid.n1{{grid-template-columns:1fr}} .media-grid.n2{{grid-template-columns:1fr 1fr}}
-      .media-grid.n3{{grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr}} .media-grid.n4{{grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr}}
+      .media-grid.n1{{grid-template-columns:1fr}} .media-grid.n2{{grid-template-columns:1fr 1fr;aspect-ratio:16 / 9}}
+      .media-grid.n3{{grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;aspect-ratio:4 / 3}} .media-grid.n4{{grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;aspect-ratio:7 / 8}}
       .media-grid.n3 .media-cell:nth-child(1){{grid-row:1 / span 2}}
       .media-cell{{min-height:220px;max-height:720px;background:{border};overflow:hidden;}}
+      .media-grid.n2 .media-cell,.media-grid.n3 .media-cell,.media-grid.n4 .media-cell{{min-height:0;max-height:none;height:100%;}}
       .media-cell img{{width:100%;height:100%;max-height:720px;object-fit:cover;display:block;}}
       .media-grid.n1 .media-cell img{{height:auto;object-fit:contain;}}
-      .video-cell{{display:flex;align-items:center;justify-content:center;aspect-ratio:1 / 1;}}
+      .video-cell{{display:flex;align-items:center;justify-content:center;}}
+      .media-grid.n1 .video-cell{{aspect-ratio:1 / 1;}}
       .video-cell video{{width:100%;height:100%;object-fit:cover;display:block;background:#000;}}
       .quote{{border:1px solid {border};border-radius:14px;padding:12px;margin-top:12px;overflow:hidden;}}
       .quote-user{{font-size:15px;line-height:1.3}} .quote-user span{{color:{muted}}}
