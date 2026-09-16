@@ -4035,12 +4035,15 @@ def _capture_detail_snapshot(
                       const inset = Math.max(0, cardWidth - singleMediaGrid.getBoundingClientRect().width);
                       // Reflow text and metrics with the portrait frame instead
                       // of keeping a wide card around a narrow centered video.
-                      const compactWidth = Math.min(cardWidth, Math.max(320, maxFrameWidth + inset));
+                      const compactWidth = Math.min(cardWidth, Math.max(390, maxFrameWidth + inset));
                       article.style.setProperty('width', `${compactWidth}px`, 'important');
                       article.style.setProperty('max-width', `${compactWidth}px`, 'important');
                       article.style.setProperty('min-width', '0', 'important');
+                      article.setAttribute('data-resource-snapshot-compact', 'true');
                     }
-                    singleMediaGrid.style.setProperty('max-width', `${maxFrameWidth}px`, 'important');
+                    const mediaMaxWidth = article.hasAttribute('data-resource-snapshot-compact')
+                      ? '100%' : `${maxFrameWidth}px`;
+                    singleMediaGrid.style.setProperty('max-width', mediaMaxWidth, 'important');
                     singleMediaGrid.style.setProperty('margin-left', 'auto', 'important');
                     singleMediaGrid.style.setProperty('margin-right', 'auto', 'important');
                     // Earlier player cleanup may have pinned its old pixel
@@ -4912,6 +4915,10 @@ def _render_public_status_card(page, status: dict, tweet_id: str, *, dark_mode: 
       .icon{{width:20px;height:20px;display:inline-flex;align-items:center;justify-content:center;flex:none;}}
       .icon svg{{width:20px;height:20px;fill:currentColor;display:block;}}
       .count{{font-size:14px;line-height:20px;color:{muted};white-space:nowrap;}}
+      article[data-resource-snapshot-compact] .actions{{grid-template-columns:repeat(5,max-content);justify-content:space-between;column-gap:10px;padding:12px 4px 0!important;}}
+      article[data-resource-snapshot-compact] .action{{padding:4px 0;gap:4px;}}
+      article[data-resource-snapshot-compact] .icon,
+      article[data-resource-snapshot-compact] .icon svg{{width:18px;height:18px;}}
       {_translation_capture_css(dark_mode)}
     </style></head><body>
       <main role="main"><article data-testid="tweet" data-tweet-id="{_html_escape(tweet_id)}">
