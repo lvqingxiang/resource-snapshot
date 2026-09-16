@@ -380,6 +380,8 @@ article[data-resource-snapshot-multi-photo] [data-testid="tweetPhoto"] img {{
 article video {{
   display: block !important;
   max-width: 100% !important;
+  object-fit: contain !important;
+  object-position: center center !important;
   background: transparent !important;
 }}
 
@@ -2692,7 +2694,10 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                 if (drewFrame) {
                   canvas.style.width = '100%';
                   canvas.style.height = '100%';
-                  canvas.style.objectFit = 'cover';
+                  // The player may be square even when the decoded frame is
+                  // portrait. Preserve every source pixel instead of cropping
+                  // the frame to fill the player's aspect ratio.
+                  canvas.style.objectFit = 'contain';
                   canvas.style.objectPosition = 'center center';
                   canvas.style.display = 'block';
                   cell.appendChild(canvas);
@@ -4017,12 +4022,42 @@ def _capture_detail_snapshot(
                   }
                   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
+                  // Bound tall single-video cards by shrinking the whole frame,
+                  // rather than clipping the video or adding letterbox space.
+                  const singleMediaGrid = player.closest('.media-grid.n1');
+                  if (singleMediaGrid instanceof HTMLElement) {
+                    const maxFrameHeight = 600;
+                    const maxFrameWidth = maxFrameHeight * canvas.width / canvas.height;
+                    if (article.querySelectorAll('.media-grid').length === 1 &&
+                        article.querySelectorAll('video').length === 1 &&
+                        canvas.height > canvas.width) {
+                      const cardWidth = article.getBoundingClientRect().width;
+                      const inset = Math.max(0, cardWidth - singleMediaGrid.getBoundingClientRect().width);
+                      // Reflow text and metrics with the portrait frame instead
+                      // of keeping a wide card around a narrow centered video.
+                      const compactWidth = Math.min(cardWidth, Math.max(320, maxFrameWidth + inset));
+                      article.style.setProperty('width', `${compactWidth}px`, 'important');
+                      article.style.setProperty('max-width', `${compactWidth}px`, 'important');
+                      article.style.setProperty('min-width', '0', 'important');
+                    }
+                    singleMediaGrid.style.setProperty('max-width', `${maxFrameWidth}px`, 'important');
+                    singleMediaGrid.style.setProperty('margin-left', 'auto', 'important');
+                    singleMediaGrid.style.setProperty('margin-right', 'auto', 'important');
+                    // Earlier player cleanup may have pinned its old pixel
+                    // height. Recompute it after the narrower grid has reflowed.
+                    const frameWidth = player.getBoundingClientRect().width;
+                    player.style.setProperty('height', `${frameWidth * canvas.height / canvas.width}px`, 'important');
+                    player.style.setProperty('min-height', '0', 'important');
+                    player.style.setProperty('max-height', 'none', 'important');
+                  }
+
                   canvas.setAttribute('data-resource-snapshot-video-frame', 'true');
                   canvas.style.position = 'absolute';
                   canvas.style.inset = '0';
                   canvas.style.width = '100%';
                   canvas.style.height = '100%';
-                  canvas.style.objectFit = 'cover';
+                  canvas.style.objectFit = 'contain';
+                  canvas.style.objectPosition = 'center center';
                   canvas.style.display = 'block';
                   canvas.style.zIndex = '999';
                   canvas.style.pointerEvents = 'none';
@@ -4408,7 +4443,7 @@ def _normalize_vxtwitter_status(data: dict) -> dict | None:
                 continue
             typ = str(item.get("type") or "").lower()
             if typ in {"video", "gif"} or "video.twimg.com" in u or ".mp4" in u.lower().split("?", 1)[0]:
-                videos.append({"type": typ or "video", "url": u})
+                videos.append({"type": typ or "video", "url": u, "thumbnail_url": item.get("thumbnail_url")})
             else:
                 photos.append({"type": "photo", "url": u})
     if not photos and not videos and isinstance(data.get("mediaURLs"), list):
@@ -4420,6 +4455,14 @@ def _normalize_vxtwitter_status(data: dict) -> dict | None:
             elif "twimg.com/media" in u:
                 photos.append({"type": "photo", "url": u})
     return {
+        "id": data.get("tweetID"),
+        "url": data.get("tweetURL"),
+        "quote": (
+            _normalize_vxtwitter_status(data["qrt"])
+            if isinstance(data.get("qrt"), dict)
+            else ({"type": "tombstone", "url": data["qrtURL"], "message": "引用帖暂时无法加载"}
+                  if data.get("qrtURL") else None)
+        ),
         "text": data.get("text") or "",
         "created_timestamp": data.get("date_epoch"),
         "author": {
@@ -4440,7 +4483,7 @@ def _fetch_public_x_status(
     *,
     timeout: float = 6,
 ) -> tuple[dict | None, str]:
-    """Fetch anonymous mirror JSON; use the first compatible service to respond."""
+    """Fetch mirror JSON and reconcile quotes before accepting a partial response."""
     candidates: list[tuple[str, str, Callable[[dict], dict | None]]] = []
 
     def parse_fxtwitter_v2(data: dict) -> dict | None:
@@ -4479,6 +4522,16 @@ def _fetch_public_x_status(
     }
     fallback_status: dict | None = None
     fallback_source = ""
+    primary_status: dict | None = None
+    primary_source = ""
+    best_quote: dict | None = None
+    def quote_rank(quote: dict | None) -> int:
+        if not quote:
+            return 0
+        if quote.get("type") == "tombstone":
+            return 1
+        return 2 if quote.get("author") or quote.get("text") or quote.get("media") else 1
+
     try:
         for future in as_completed(futures, timeout=timeout + 1):
             source, parser = futures[future]
@@ -4488,18 +4541,27 @@ def _fetch_public_x_status(
                 continue
             status = parser(data) if isinstance(data, dict) else None
             if isinstance(status, dict):
+                quote = status.get("quote")
+                if isinstance(quote, dict) and quote_rank(quote) > quote_rank(best_quote):
+                    best_quote = quote
                 if source == "vxtwitter":
                     fallback_status = status
                     fallback_source = source
                     continue
-                return status, source
+                if primary_status is None:
+                    primary_status = status
+                    primary_source = source
     except FutureTimeoutError:
         pass
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
 
-    if isinstance(fallback_status, dict):
-        return fallback_status, fallback_source
+    selected = primary_status if primary_status is not None else fallback_status
+    if selected is not None:
+        selected = dict(selected)
+        if best_quote is not None:
+            selected["quote"] = best_quote
+        return selected, primary_source or fallback_source
     return None, ""
 
 
@@ -4769,6 +4831,11 @@ def _render_public_status_card(page, status: dict, tweet_id: str, *, dark_mode: 
             f'<div data-testid="tweetText" class="quote-text">{_html_escape(qtext)}</div>{qmedia}'
             '</div>'
         )
+        if quote.get("type") == "tombstone":
+            quote_html = (
+                '<div data-testid="quoteTweet" class="quote">'
+                '<div class="quote-text">引用帖暂时无法加载</div></div>'
+            )
 
     reply = fmt_count(metric("replies", "reply_count"))
     repost = fmt_count(metric("retweets", "reposts", "retweet_count"))
@@ -4830,8 +4897,9 @@ def _render_public_status_card(page, status: dict, tweet_id: str, *, dark_mode: 
       .media-cell img{{width:100%;height:100%;max-height:720px;object-fit:cover;display:block;}}
       .media-grid.n1 .media-cell img{{height:auto;object-fit:contain;}}
       .video-cell{{display:flex;align-items:center;justify-content:center;}}
-      .media-grid.n1 .video-cell{{aspect-ratio:1 / 1;}}
-      .video-cell video{{width:100%;height:100%;object-fit:cover;display:block;background:#000;}}
+      .media-grid.n1 .video-cell{{aspect-ratio:auto;min-height:0;max-height:none;}}
+      .video-cell video{{width:100%;height:100%;object-fit:contain;object-position:center;display:block;background:#000;}}
+      .media-grid.n1 .video-cell video{{height:auto;}}
       .quote{{border:1px solid {border};border-radius:14px;padding:12px;margin-top:12px;overflow:hidden;}}
       .quote-user{{font-size:15px;line-height:1.3}} .quote-user span{{color:{muted}}}
       .quote-text{{font-size:15px!important;line-height:1.45!important;margin:8px 0!important;}}
