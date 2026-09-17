@@ -3991,6 +3991,30 @@ def _capture_detail_snapshot(
                 engagementGroup.style.setProperty('overflow', 'visible', 'important');
               }
 
+              // Photo-only fallback grids must retain the complete images.
+              // X-style fixed mosaic heights crop tall screenshots and text.
+              for (const grid of article.querySelectorAll('.media-grid')) {
+                const cells = [...grid.children];
+                if (!cells.length || !cells.every((cell) =>
+                  cell.matches('[data-testid="tweetPhoto"]') && cell.querySelector('img'))) {
+                  continue;
+                }
+                grid.style.setProperty('aspect-ratio', 'auto', 'important');
+                grid.style.setProperty('grid-template-rows', 'none', 'important');
+                grid.style.setProperty('align-items', 'start', 'important');
+                for (const cell of cells) {
+                  cell.style.setProperty('height', 'auto', 'important');
+                  cell.style.setProperty('min-height', '0', 'important');
+                  cell.style.setProperty('max-height', 'none', 'important');
+                  cell.style.setProperty('grid-row', 'auto', 'important');
+                  const img = cell.querySelector('img');
+                  img.style.setProperty('width', '100%', 'important');
+                  img.style.setProperty('height', 'auto', 'important');
+                  img.style.setProperty('max-height', 'none', 'important');
+                  img.style.setProperty('object-fit', 'contain', 'important');
+                }
+              }
+
               // Freeze each visible X video into a canvas after the requested
               // frame has already been selected. This removes every player
               // overlay (including ordinary div-based progress bars) without
