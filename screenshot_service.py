@@ -3991,27 +3991,82 @@ def _capture_detail_snapshot(
                 engagementGroup.style.setProperty('overflow', 'visible', 'important');
               }
 
-              // Photo-only fallback grids must retain the complete images.
-              // X-style fixed mosaic heights crop tall screenshots and text.
+              // Photo-only fallback grids: align heights per row instead of
+              // X's fixed mosaic (which crops tall screenshots and text) or
+              // fully auto heights (which look ragged when photos come from
+              // different devices). Each row takes the tallest image's
+              // natural height at the column width: taller photos stay
+              // intact, shorter ones are cover-cropped (losing left/right
+              // edges) to match the row.
               for (const grid of article.querySelectorAll('.media-grid')) {
                 const cells = [...grid.children];
                 if (!cells.length || !cells.every((cell) =>
                   cell.matches('[data-testid="tweetPhoto"]') && cell.querySelector('img'))) {
                   continue;
                 }
-                grid.style.setProperty('aspect-ratio', 'auto', 'important');
-                grid.style.setProperty('grid-template-rows', 'none', 'important');
-                grid.style.setProperty('align-items', 'start', 'important');
-                for (const cell of cells) {
+                const imgs = cells.map((cell) => cell.querySelector('img'));
+                if (!imgs.every((img) => img.complete && img.naturalWidth > 0)) {
+                  // Sizes unknown yet: fall back to X-style fixed mosaic.
+                  continue;
+                }
+                if (cells.length === 1) {
+                  // Single photo: keep the complete image, unconstrained.
+                  grid.style.setProperty('aspect-ratio', 'auto', 'important');
+                  grid.style.setProperty('grid-template-rows', 'none', 'important');
+                  grid.style.setProperty('align-items', 'start', 'important');
+                  const cell = cells[0];
                   cell.style.setProperty('height', 'auto', 'important');
                   cell.style.setProperty('min-height', '0', 'important');
                   cell.style.setProperty('max-height', 'none', 'important');
-                  cell.style.setProperty('grid-row', 'auto', 'important');
-                  const img = cell.querySelector('img');
+                  const img = imgs[0];
                   img.style.setProperty('width', '100%', 'important');
                   img.style.setProperty('height', 'auto', 'important');
                   img.style.setProperty('max-height', 'none', 'important');
                   img.style.setProperty('object-fit', 'contain', 'important');
+                  continue;
+                }
+
+                const gap = 2;
+                const gridWidth = grid.getBoundingClientRect().width;
+                const columnWidth = Math.max((gridWidth - gap) / 2, 1);
+                const naturalHeights = imgs.map((img) =>
+                  columnWidth * img.naturalHeight / img.naturalWidth);
+
+                let rowHeights;
+                if (grid.classList.contains('n3')) {
+                  // Left photo spans both rows; its natural height splits
+                  // across the two rows. Each row takes the taller of the
+                  // right-column photo and the left photo's per-row share;
+                  // the shorter one is cover-cropped.
+                  const rowShare = Math.max((naturalHeights[0] - gap) / 2, 1);
+                  rowHeights = [
+                    Math.max(naturalHeights[1], rowShare),
+                    Math.max(naturalHeights[2], rowShare),
+                  ];
+                } else if (cells.length >= 4) {
+                  rowHeights = [
+                    Math.max(naturalHeights[0], naturalHeights[1]),
+                    Math.max(naturalHeights[2], naturalHeights[3]),
+                  ];
+                } else {
+                  rowHeights = [Math.max(naturalHeights[0], naturalHeights[1])];
+                }
+
+                // Cells are already height:100% (stretch) via CSS; only the
+                // grid rows and the img 720px cap need overriding.
+                grid.style.setProperty('aspect-ratio', 'auto', 'important');
+                grid.style.setProperty(
+                  'grid-template-rows',
+                  rowHeights.map((h) => `${Math.round(h)}px`).join(' '),
+                  'important'
+                );
+                grid.style.setProperty('align-items', 'stretch', 'important');
+                for (const img of imgs) {
+                  img.style.setProperty('width', '100%', 'important');
+                  img.style.setProperty('height', '100%', 'important');
+                  img.style.setProperty('max-height', 'none', 'important');
+                  img.style.setProperty('object-fit', 'cover', 'important');
+                  img.style.setProperty('object-position', 'center center', 'important');
                 }
               }
 
