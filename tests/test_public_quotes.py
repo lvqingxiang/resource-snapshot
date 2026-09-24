@@ -1,10 +1,11 @@
 import unittest
 from unittest.mock import patch
-import screenshot_service as service
+from snapshot import public_data as service
 
 
 class PublicQuoteTests(unittest.TestCase):
     def fetch(self, vx, fx_quote=None):
+        service._fetch_public_x_status.cache_clear()
         status = {'text': 'Main', 'views': 123}
         if fx_quote is not None:
             status['quote'] = fx_quote

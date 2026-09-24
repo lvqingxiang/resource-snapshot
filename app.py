@@ -91,6 +91,7 @@ def api_capture():
             SCREENSHOTS_DIR,
             PROFILE_DIR,
             headless=not show_browser,
+            anonymous=bool(payload.get("anonymous")),
             dark_mode=dark_mode,
             video_frame_schedule=video_frame_schedule,
             translate_body=translate_body,
@@ -148,6 +149,7 @@ def api_preview_translations():
             url,
             PROFILE_DIR,
             headless=not show_browser,
+            anonymous=bool(payload.get("anonymous")),
             dark_mode=dark_mode,
         ).result()
     except ValueError as exc:

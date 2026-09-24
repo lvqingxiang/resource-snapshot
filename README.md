@@ -11,8 +11,15 @@
 ## 目录说明
 
 - `app.py`: 本地网页服务
-- `screenshot_service.py`: Playwright 截图逻辑
-- `static/index.html`: 输入链接的网页
+- `screenshot_service.py`: 保持兼容的截图服务入口
+- `snapshot/service.py`: 截图、翻译预览的流程编排
+- `snapshot/browser.py`: 浏览器会话、HLS 清晰度策略
+- `snapshot/public_data.py`、`snapshot/render.py`: 公开数据获取与卡片生成
+- `snapshot/translation.py`、`snapshot/video.py`: 翻译与视频帧处理
+- `snapshot/dom.py`、`snapshot/layout.py`、`snapshot/styles.py`: DOM 等待、截图布局和样式
+- `snapshot/cache.py`: 有容量和有效期限制的内存缓存
+- `snapshot/models.py`、`snapshot/config.py`、`snapshot/urls.py`: 数据结构、常量和链接处理
+- `static/index.html`、`static/app.js`、`static/styles.css`: 网页结构、交互与样式
 - `screenshots/`: 保存生成的截图
 - `browser_profile/`: 浏览器登录信息缓存
 
@@ -78,3 +85,34 @@ playwright install chromium
 4. 重新截图。
 
 登录状态会保存到 `browser_profile/`，下次通常不用重新登录。
+
+## 登录状态与截图来源
+
+默认复用 `browser_profile/` 中的登录状态，即使未勾选“显示浏览器”也会使用。
+“显示浏览器”仅控制窗口是否可见；需要首次登录时请勾选它，并关闭“匿名访问”。
+勾选“匿名访问”会使用独立的临时会话，不读取或保存登录状态，并优先尝试公开数据。
+
+结果区会区分“详情页截图”和“公开数据重绘（非原网页截图）”。
+公开数据重绘使用第三方公开接口返回的内容生成卡片，来源链接仍指向原推文。
+修改推文链接或访问选项后，需要重新获取翻译；进行中的旧翻译结果会被丢弃。
+
+## 性能与验证
+
+推文定位使用一个统一等待条件，避免依次等待多个不存在的选择器。
+页面导航后直接等待目标推文出现，不再额外等待固定的 8 秒或网络空闲；
+图片、视频与截图布局的就绪检查仍保留。
+
+成功获取的公开数据在内存中缓存 60 秒，最多 64 条；因此短时间重复截图的互动数字可能相同。
+翻译和 oEmbed 原文分别缓存 10 分钟、最多 128 条。失败结果不缓存，下一次仍会重试。
+缓存随服务重启清空，不写入磁盘，也不缓存登录页面或浏览器会话。
+
+在已安装依赖的 Python 环境中运行：
+
+```bash
+python -m unittest discover -s tests -v
+node tests/test_frontend.cjs
+RUN_BROWSER_TESTS=1 python -m unittest discover -s tests -p test_local_browser.py -v
+```
+
+最后一条需要已安装 Playwright Chromium，使用本地测试数据验证定位和完整 PNG 截图流程。
+这些检查不依赖真实 X 内容，不能替代真实站点兼容性验证。
