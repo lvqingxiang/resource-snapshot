@@ -68,12 +68,13 @@ def _load_tweet_card(
     dark_mode: bool,
     wait_timeout_ms: int,
     guest_mode: bool = False,
+    prefer_public: bool = False,
 ):
     last_error: Exception | None = None
     public_status: dict | None = None
     public_source = ""
 
-    if guest_mode:
+    if guest_mode or prefer_public:
         public_status, public_source = _fetch_public_x_status(tweet_id, screen_name=screen_name, timeout=3)
         if isinstance(public_status, dict):
             try:
@@ -172,6 +173,13 @@ def preview_tweet_translations(
             guest_mode=guest_mode,
         )
         page = session.page
+        # Translation needs text only. Do not download image/video assets.
+        page.route(
+            "**/*",
+            lambda route: route.abort()
+            if route.request.resource_type in {"image", "media", "font"}
+            else route.continue_(),
+        )
         try:
             tweet_card, used_url, capture_mode = _load_tweet_card(
                 page,
@@ -181,9 +189,8 @@ def preview_tweet_translations(
                 dark_mode=dark_mode,
                 wait_timeout_ms=wait_timeout_ms,
                 guest_mode=guest_mode,
+                prefer_public=headless,
             )
-            if capture_mode != "public_api_fallback":
-                _wait_for_tweet_assets(page, tweet_card)
 
             text_blocks = _collect_translation_text_blocks(tweet_card, used_url or normalized_url)
             items = tuple(

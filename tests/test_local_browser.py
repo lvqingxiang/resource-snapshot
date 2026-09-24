@@ -35,6 +35,27 @@ class LocalBrowserTests(unittest.TestCase):
             self.assertEqual(_wait_for_tweet_card(page, '123', 1000).inner_text(), 'Visible')
             browser.close()
 
+    def test_public_preview_translates_text_without_media(self):
+        status = {
+            'id': '123', 'text': 'Main preview text',
+            'author': {'name': 'Fixture', 'screen_name': 'fixture'},
+            'quote': {'text': 'Quoted preview text', 'author': {'screen_name': 'quoted'}},
+            'media': {'photos': [{'url': 'https://example.invalid/slow-image.png'}]},
+        }
+        from snapshot import translation
+        with TemporaryDirectory() as temp, patch.object(
+            service, '_fetch_public_x_status', return_value=(status, 'fixture')
+        ), patch.object(
+            translation, '_translate_text_to_chinese', side_effect=lambda text, lang: '中文：' + text
+        ), patch.object(translation, '_fetch_oembed_tweet_body') as oembed:
+            result = service.preview_tweet_translations(
+                'https://x.com/fixture/status/123', Path(temp) / 'profile'
+            )
+        self.assertEqual(result.capture_mode, 'public_api_fallback')
+        self.assertEqual([item.original_text for item in result.items],
+                         ['Main preview text', 'Quoted preview text'])
+        oembed.assert_not_called()
+
     def test_public_capture_pipeline(self):
         status = {
             'id': '123', 'text': 'Offline capture fixture',

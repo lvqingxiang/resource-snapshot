@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from html import unescape
 from urllib.parse import urlencode
 from urllib.request import Request
@@ -96,7 +97,7 @@ def _looks_like_chinese_text(text: str) -> bool:
     return han > 0 and han >= latin
 
 
-def _fetch_translation_payload(url: str) -> object | None:
+def _fetch_translation_payload(url: str, *, timeout: float = 5) -> object | None:
     request = Request(
         url,
         headers={
@@ -106,7 +107,7 @@ def _fetch_translation_payload(url: str) -> object | None:
     )
 
     try:
-        with urlopen(request, timeout=12) as response:
+        with urlopen(request, timeout=timeout) as response:
             return json.load(response)
     except Exception:
         return None
@@ -120,7 +121,7 @@ def _fetch_oembed_tweet_body(status_url: str) -> tuple[str | None, str | None]:
         return None, None
 
     query = urlencode({"url": normalized, "omit_script": "1"})
-    payload = _fetch_translation_payload(f"{TWITTER_OEMBED_API_URL}?{query}")
+    payload = _fetch_translation_payload(f"{TWITTER_OEMBED_API_URL}?{query}", timeout=3)
     if not isinstance(payload, dict):
         return None, None
 
@@ -263,6 +264,17 @@ def _extract_quoted_status_urls(tweet_card, status_url: str | None = None) -> li
 
 def _collect_translation_text_blocks(tweet_card, status_url: str | None = None) -> list[dict[str, str | int | None]]:
     """Extract tweet bodies for translation, with per-tweet oEmbed fallback for quoted posts."""
+    # Public cards already contain the original source text, never X's auto-translation.
+    if (status_url or "").startswith("public-api://"):
+        return _extract_translatable_text_blocks(tweet_card)
+
+    # Retry failures on the next request, not multiple times within this one.
+    originals = {}
+    def fetch_original(url):
+        if url not in originals:
+            originals[url] = _fetch_oembed_tweet_body(url)
+        return originals[url]
+
     _dismiss_x_auto_translation(tweet_card)
     text_blocks = _extract_translatable_text_blocks(tweet_card)
 
@@ -275,7 +287,7 @@ def _collect_translation_text_blocks(tweet_card, status_url: str | None = None) 
         if _text_looks_non_chinese(text):
             continue
 
-        oembed_text, oembed_lang = _fetch_oembed_tweet_body(block_url)
+        oembed_text, oembed_lang = fetch_original(block_url)
         if not oembed_text or not _text_looks_non_chinese(oembed_text):
             continue
 
@@ -303,7 +315,7 @@ def _collect_translation_text_blocks(tweet_card, status_url: str | None = None) 
         quoted_id = _extract_status_id_from_url(quoted_url)
         if not quoted_id or quoted_id in seen_ids:
             continue
-        oembed_text, oembed_lang = _fetch_oembed_tweet_body(quoted_url)
+        oembed_text, oembed_lang = fetch_original(quoted_url)
         if not oembed_text or not _text_looks_non_chinese(oembed_text):
             continue
         if oembed_text in seen_texts:
@@ -322,7 +334,7 @@ def _collect_translation_text_blocks(tweet_card, status_url: str | None = None) 
     if any(_text_looks_non_chinese(str(block.get("text") or "")) for block in text_blocks):
         return text_blocks
 
-    oembed_text, oembed_lang = _fetch_oembed_tweet_body(status_url or "")
+    oembed_text, oembed_lang = fetch_original(status_url or "")
     if not oembed_text or not _text_looks_non_chinese(oembed_text):
         return text_blocks
 
@@ -605,56 +617,50 @@ def _build_translation_items(
     overrides = {int(index): str(value) for index, value in (translation_overrides or {}).items()}
     overrides.update(custom_translation_overrides)
 
-    cache: dict[tuple[str, str], str | None] = {}
-    items: list[dict[str, str | int]] = []
-    for index, block in enumerate(text_blocks):
-        text = str(block.get("text") or "").strip()
-        lang = _normalize_translation_lang(block.get("lang"))
-        if not text:
-            continue
-
-        translation: str | None
-        if index in overrides:
-            translation = str(overrides[index]).strip()
-        elif index < len(custom_translation_blocks):
-            translation = custom_translation_blocks[index]
-        else:
-            # X may tag restored Spanish/English/ja/ko bodies as lang=zh after auto-translate.
-            # Skip only when the text itself is predominantly Chinese.
+    pending = {}
+    prepared = []
+    # Only plain text/network work crosses threads; Playwright stays on its owning thread.
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="translate") as executor:
+        for position, block in enumerate(text_blocks):
+            index = int(block["index"])
+            text = str(block.get("text") or "").strip()
+            lang = _normalize_translation_lang(block.get("lang"))
+            if not text:
+                continue
+            if index in overrides:
+                prepared.append((block, text, str(overrides[index]).strip(), None))
+                continue
+            if position < len(custom_translation_blocks):
+                prepared.append((block, text, custom_translation_blocks[position], None))
+                continue
             if lang and lang.startswith("zh") and not _text_looks_non_chinese(text):
                 continue
             if not lang and _looks_like_chinese_text(text):
                 continue
-            # When lang is wrongly zh but body is foreign, force auto language detection.
-            if lang and lang.startswith("zh") and _text_looks_non_chinese(text):
-                effective_lang = "auto"
-            else:
-                effective_lang = lang or _detect_translation_source_lang(text)
-            cache_key = (text, effective_lang or "auto")
-            if cache_key not in cache:
-                cache[cache_key] = _translate_text_to_chinese(
-                    text,
-                    None if effective_lang in (None, "auto") else effective_lang,
-                )
-            translation = cache[cache_key]
-            # Keep non-Chinese body text in the review UI even if providers fail,
-            # so the user can fill in a manual translation.
-            if not translation and effective_lang and not str(effective_lang).startswith("zh"):
-                translation = ""
+            effective_lang = (
+                None if lang and lang.startswith("zh")
+                else lang or _detect_translation_source_lang(text)
+            )
+            key = (text, effective_lang)
+            if key not in pending:
+                pending[key] = executor.submit(_translate_text_to_chinese, text, effective_lang)
+            prepared.append((block, text, None, pending[key]))
 
-        if translation is None:
-            continue
-        if translation and translation.casefold() == text.casefold():
-            continue
-
-        items.append(
-            {
+        items: list[dict[str, str | int]] = []
+        for block, text, translation, future in prepared:
+            if future is not None:
+                try:
+                    translation = future.result() or ""
+                except Exception:
+                    translation = ""
+            if translation and translation.casefold() == text.casefold():
+                continue
+            items.append({
                 "index": int(block["index"]),
                 "text": text,
                 "translation": translation,
                 "status_url": str(block.get("status_url") or ""),
-            }
-        )
+            })
 
     return items
 
