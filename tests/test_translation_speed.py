@@ -93,6 +93,25 @@ class TranslationSpeedTests(unittest.TestCase):
         self.assertEqual(result[2], 'detail_page')
         page.goto.assert_called_once()
 
+    def test_blocked_detail_page_skips_card_wait(self):
+        page = MagicMock()
+        page.goto.return_value.status = 403
+        card = MagicMock()
+        with patch.object(
+            service, '_fetch_public_x_status', return_value=({'text': 'Original'}, 'fixture')
+        ), patch.object(service, '_wait_for_tweet_card') as wait, patch.object(
+            service, '_load_public_fallback_tweet_card',
+            return_value=(card, 'public-api://fixture/status/123', 'public_api_fallback'),
+        ), patch.object(service, '_prepare_public_fallback_card'):
+            result = service._load_tweet_card(
+                page, 'https://x.com/a/status/123', 'a', '123',
+                dark_mode=True, wait_timeout_ms=30000,
+            )
+        self.assertIs(result[0], card)
+        self.assertEqual(result[2], 'public_api_fallback')
+        wait.assert_not_called()
+        self.assertEqual(page.goto.call_count, 1)
+
 
 if __name__ == '__main__':
     unittest.main()

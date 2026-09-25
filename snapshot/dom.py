@@ -3,10 +3,6 @@
 from __future__ import annotations
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-import time
-from .config import (
-    GUEST_POST_SCROLL_MS,
-)
 
 
 def _dismiss_common_overlays(page) -> None:
@@ -324,7 +320,6 @@ def _wait_for_tweet_card(page, tweet_id: str, timeout_ms: int):
 
 def _scroll_tweet_into_view(page, tweet_card, *, guest_mode: bool = False) -> None:
     tweet_card.scroll_into_view_if_needed(timeout=10000)
-    page.wait_for_timeout(GUEST_POST_SCROLL_MS if guest_mode else 500)
 
     box = tweet_card.bounding_box()
     if not box:
@@ -333,7 +328,8 @@ def _scroll_tweet_into_view(page, tweet_card, *, guest_mode: bool = False) -> No
     top_padding = 16 if guest_mode else 120
     target_top = max(int(box["y"] - top_padding), 0)
     page.evaluate("(top) => window.scrollTo(0, top)", target_top)
-    page.wait_for_timeout(300 if guest_mode else 700)
+    # Layout only. Image and video readiness is checked separately.
+    page.wait_for_timeout(80)
 
 
 def _wait_for_tweet_assets(page, tweet_card) -> None:
@@ -345,11 +341,14 @@ def _wait_for_tweet_assets(page, tweet_card) -> None:
         page.wait_for_function(
             """
             (el) => {
-              if (el.querySelector('video')) {
-                return true;
-              }
-              const images = [...el.querySelectorAll('.media-cell img')]
-                .filter((img) => img.offsetParent !== null);
+              const images = [...el.querySelectorAll(
+                '[data-testid="tweetPhoto"] img, [data-testid="card.layoutLarge.media"] img, [data-testid="card.layoutSmall.media"] img, .media-cell img'
+              )].filter((img) => {
+                if (!(img instanceof HTMLImageElement) || img.offsetParent === null) {
+                  return false;
+                }
+                return !img.closest('[data-testid="Tweet-User-Avatar"], [data-testid^="UserAvatar"]');
+              });
               return images.length === 0 || images.every(
                 (img) => img.complete && img.naturalWidth > 0
               );
@@ -366,7 +365,15 @@ def _wait_for_tweet_assets(page, tweet_card) -> None:
             """
             (el) => {
               const busyNodes = [...el.querySelectorAll('[aria-busy="true"], [role="progressbar"]')]
-                .filter((node) => node.offsetParent !== null);
+                .filter((node) => {
+                  if (node.offsetParent === null) {
+                    return false;
+                  }
+                  // Video scrubbers stay visible for the whole clip and are not a load gate.
+                  return !node.closest(
+                    'video, [data-testid="videoComponent"], [data-testid="videoPlayer"]'
+                  );
+                });
               return busyNodes.length === 0;
             }
             """,
@@ -400,7 +407,7 @@ def _wait_for_tweet_assets(page, tweet_card) -> None:
     except PlaywrightTimeoutError:
         pass
 
-    page.wait_for_timeout(1200)
+    page.wait_for_timeout(80)
 
 
 def _wait_for_public_fallback_assets(page, tweet_card) -> None:
@@ -421,6 +428,25 @@ def _wait_for_public_fallback_assets(page, tweet_card) -> None:
             """,
             arg=element,
             timeout=2500,
+        )
+    except PlaywrightTimeoutError:
+        pass
+
+    try:
+        page.wait_for_function(
+            """
+            (el) => {
+              const videos = [...el.querySelectorAll('video')].filter((video) => {
+                const src = video.currentSrc || video.src || video.getAttribute('src') || '';
+                return Boolean(src);
+              });
+              return videos.length === 0 || videos.every(
+                (video) => video.readyState >= 1 || video.error
+              );
+            }
+            """,
+            arg=element,
+            timeout=8000,
         )
     except PlaywrightTimeoutError:
         pass

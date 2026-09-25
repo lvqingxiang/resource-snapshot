@@ -175,6 +175,35 @@ def _prepare_video_frames(
                     node.closest('[data-testid="quoteTweet"]'),
                 );
 
+              // Public-fallback clips use height:auto and collapse to 0px until
+              // loadedmetadata. Chrome then drops the preload, and a visibility
+              // filter would skip the seek entirely (screenshot stays on the poster).
+              const collapsed = [...root.querySelectorAll('video')].filter((video) => {
+                if (!(video instanceof HTMLVideoElement)) {
+                  return false;
+                }
+                const src = video.currentSrc || video.src || video.getAttribute('src') || '';
+                if (!src || video.readyState >= 1) {
+                  return false;
+                }
+                const rect = video.getBoundingClientRect();
+                return rect.width >= 48 && rect.height < 48;
+              });
+              for (const video of collapsed) {
+                try {
+                  video.preload = 'auto';
+                  video.load();
+                } catch (error) {
+                }
+                if (video.readyState >= 1 || video.error) {
+                  continue;
+                }
+                await Promise.race([
+                  once(video, 'loadedmetadata', 8000),
+                  once(video, 'error', 8000),
+                ]);
+              }
+
               const videos = [...root.querySelectorAll('video')]
                 .filter((video) => isVisible(video))
                 .map((video) => {
@@ -305,20 +334,6 @@ def _prepare_video_frames(
                 ]);
               };
 
-              const playFor = async (ms) => {
-                try {
-                  activatePlayer();
-                  const playPromise = video.play();
-                  if (playPromise && typeof playPromise.then === 'function') {
-                    await Promise.race([playPromise.catch(() => undefined), wait(250)]);
-                  } else {
-                    await wait(250);
-                  }
-                } catch (error) {
-                }
-                await wait(ms);
-              };
-
               const pauseVideo = () => {
                 try {
                   video.pause();
@@ -326,12 +341,23 @@ def _prepare_video_frames(
                 }
               };
 
-              const warmUp = async () => {
+              const warmUp = async (minWidth) => {
                 try {
-                  await playFor(publicFallbackVideo ? 350 : 1200);
+                  activatePlayer();
+                  const playPromise = video.play();
+                  if (playPromise && typeof playPromise.then === 'function') {
+                    await Promise.race([playPromise.catch(() => undefined), wait(250)]);
+                  }
+                  // Stop as soon as a decodable frame exists. The old path always
+                  // played for a fixed 1.2s even after the frame was already ready.
+                  await Promise.race([
+                    waitForDecodedFrame(minWidth, publicFallbackVideo ? 800 : 2500),
+                    wait(publicFallbackVideo ? 350 : 1200),
+                  ]);
+                } catch (error) {
                 } finally {
                   pauseVideo();
-                  await wait(publicFallbackVideo ? 80 : 180);
+                  await wait(publicFallbackVideo ? 40 : 80);
                 }
               };
 
@@ -358,20 +384,23 @@ def _prepare_video_frames(
 
               const seekTo = async (value, duration) => {
                 const nextTime = clampTime(value, duration);
-                if (Math.abs((video.currentTime || 0) - nextTime) <= 0.04) {
+                if (
+                  Math.abs((video.currentTime || 0) - nextTime) <= 0.04 &&
+                  video.readyState >= 2
+                ) {
                   return nextTime;
                 }
                 try {
-                  const seekPromise = Promise.race([
-                    once(video, 'seeking', 1200),
-                    once(video, 'seeked', 5000),
-                    once(video, 'timeupdate', 5000),
-                  ]);
+                  // Wait for seeked, not seeking. `seeking` fires before the
+                  // target frame exists, so a race against it screenshots the poster.
+                  const seeked = once(video, 'seeked', 6000);
                   video.currentTime = nextTime;
-                  await seekPromise;
+                  await seeked;
                   await waitUntil(
-                    () => Math.abs((video.currentTime || 0) - nextTime) <= 0.18,
-                    2500,
+                    () =>
+                      Math.abs((video.currentTime || 0) - nextTime) <= 0.18 &&
+                      video.readyState >= 2,
+                    4000,
                   );
                   await waitForDecodedFrame(Math.min(video.videoWidth || 640, 640), 5000);
                 } catch (error) {
@@ -429,6 +458,15 @@ def _prepare_video_frames(
               };
 
               const renderTargetFrame = async (desiredTime, duration) => {
+                // Playing again after a successful seek restarts some X players at 0
+                // and the 3.5s play window never reaches a later timestamp.
+                if (
+                  Math.abs((video.currentTime || 0) - desiredTime) <= 0.35 &&
+                  video.readyState >= 2
+                ) {
+                  pauseVideo();
+                  return;
+                }
                 try {
                   activatePlayer();
                   const playPromise = video.play();
@@ -469,10 +507,10 @@ def _prepare_video_frames(
                 960,
                 Math.max(360, Math.round(renderedShortEdge || 640)),
               );
-              await warmUp();
+              await warmUp(minDecodeWidth);
               await waitForDecodedFrame(minDecodeWidth, publicFallbackVideo ? 2500 : 8000);
               if (video.readyState < 2 || video.videoWidth < minDecodeWidth) {
-                await warmUp();
+                await warmUp(minDecodeWidth);
                 await waitForDecodedFrame(minDecodeWidth, publicFallbackVideo ? 2500 : 8000);
               }
 
@@ -500,21 +538,26 @@ def _prepare_video_frames(
               desiredTime = clampTime(desiredTime, duration);
               await seekTo(desiredTime, duration);
               if (video.readyState < 2 || video.videoWidth < minDecodeWidth) {
-                await warmUp();
+                await warmUp(minDecodeWidth);
                 await seekTo(desiredTime, duration);
               }
 
-              await renderTargetFrame(desiredTime, duration);
+              if (
+                Math.abs((video.currentTime || 0) - desiredTime) > 0.35 ||
+                video.readyState < 2
+              ) {
+                await renderTargetFrame(desiredTime, duration);
+              }
               if (Math.abs((video.currentTime || 0) - desiredTime) > 0.35) {
                 await seekTo(desiredTime, duration);
-                await renderTargetFrame(desiredTime, duration);
+                pauseVideo();
               }
 
               await waitForDecodedFrame(minDecodeWidth, publicFallbackVideo ? 2000 : 6000);
-              await wait(publicFallbackVideo ? 120 : 280);
+              await wait(80);
 
               hideVideoOverlays();
-              await wait(publicFallbackVideo ? 60 : 160);
+              await wait(40);
               return Number.isFinite(video.currentTime) ? video.currentTime : desiredTime;
               };
 

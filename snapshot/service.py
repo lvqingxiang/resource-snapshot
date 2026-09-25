@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 from .browser import (
@@ -70,6 +71,48 @@ def _load_tweet_card(
     guest_mode: bool = False,
     prefer_public: bool = False,
 ):
+    # Detail pages that X rejects come back as an empty 403. Prefetch the public
+    # card during navigation so that failure does not add another round trip.
+    public_pool = None
+    public_fetch = None
+    if not (guest_mode or prefer_public):
+        public_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="x-public-prefetch")
+        public_fetch = public_pool.submit(
+            _fetch_public_x_status,
+            tweet_id,
+            screen_name,
+            timeout=6,
+        )
+
+    try:
+        return _load_tweet_card_once(
+            page,
+            normalized_url,
+            screen_name,
+            tweet_id,
+            dark_mode=dark_mode,
+            wait_timeout_ms=wait_timeout_ms,
+            guest_mode=guest_mode,
+            prefer_public=prefer_public,
+            public_fetch=public_fetch,
+        )
+    finally:
+        if public_pool is not None:
+            public_pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _load_tweet_card_once(
+    page,
+    normalized_url: str,
+    screen_name: str,
+    tweet_id: str,
+    *,
+    dark_mode: bool,
+    wait_timeout_ms: int,
+    guest_mode: bool,
+    prefer_public: bool,
+    public_fetch,
+):
     last_error: Exception | None = None
     public_status: dict | None = None
     public_source = ""
@@ -93,12 +136,18 @@ def _load_tweet_card(
             except Exception as exc:
                 last_error = exc
 
+    blocked = False
     for candidate_url, mode in _candidate_urls(normalized_url, screen_name, tweet_id):
         try:
             # X detail pages often stay on readyState=interactive with open media
             # sockets, so waiting for "domcontentloaded" can hang until timeout
             # even after the tweet article is already in the DOM.
-            page.goto(candidate_url, wait_until="commit")
+            response = page.goto(candidate_url, wait_until="commit")
+            status = getattr(response, "status", 0) or 0
+            if status in {401, 403, 429}:
+                # Empty rejection. Further x.com/twitter.com aliases will not render a card.
+                blocked = True
+                raise RuntimeError(f"详情页返回 HTTP {status}")
             # Wait for the actual target, not unrelated network activity or a fixed delay.
             if not guest_mode:
                 _dismiss_common_overlays(page)
@@ -108,7 +157,6 @@ def _load_tweet_card(
                 raise RuntimeError("页面里没有找到可截图的推文主体")
 
             _expand_tweet_text(tweet_card)
-            page.wait_for_timeout(250)
             page.add_style_tag(content=_detail_capture_css(dark_mode))
             _hide_non_primary_columns(page, tweet_id)
             if not guest_mode:
@@ -116,7 +164,18 @@ def _load_tweet_card(
             return tweet_card, candidate_url, mode
         except Exception as exc:
             last_error = exc
+            if blocked:
+                break
             continue
+
+    if public_fetch is not None and not isinstance(public_status, dict):
+        try:
+            fetched_status, fetched_source = public_fetch.result(timeout=8)
+        except Exception as exc:
+            last_error = exc
+        else:
+            if isinstance(fetched_status, dict):
+                public_status, public_source = fetched_status, fetched_source
 
     # Anonymous X detail pages may return an empty/login-gated shell.
     # Fall back to public mirror JSON and render a local tweet-like card instead
@@ -278,12 +337,12 @@ def capture_tweet_page(
                     wait_timeout_ms=wait_timeout_ms,
                     guest_mode=guest_mode,
                 )
+                _expand_tweet_text(tweet_card)
+                _scroll_tweet_into_view(page, tweet_card, guest_mode=guest_mode)
                 if capture_mode == "public_api_fallback":
                     _wait_for_public_fallback_assets(page, tweet_card)
                 else:
                     _wait_for_tweet_assets(page, tweet_card)
-                _expand_tweet_text(tweet_card)
-                page.wait_for_timeout(200)
                 if translate_body:
                     _inject_chinese_translations(
                         tweet_card,
@@ -292,8 +351,6 @@ def capture_tweet_page(
                         status_url=used_url or normalized_url,
                     )
                     _remove_native_translation_ui(tweet_card)
-                _scroll_tweet_into_view(page, tweet_card, guest_mode=guest_mode)
-                page.wait_for_timeout(250)
                 video_frames = _prepare_video_frames(tweet_card, schedule)
                 if video_frames:
                     video_frame_seconds = video_frames[0].seconds
@@ -306,13 +363,13 @@ def capture_tweet_page(
                     break
 
             _prepare_tweet_for_screenshot(tweet_card)
-            page.wait_for_timeout(200)
             _capture_detail_snapshot(
                 page,
                 tweet_card,
                 saved_to,
                 tweet_id=tweet_id,
                 public_api_fallback=capture_mode == "public_api_fallback",
+                guest_mode=guest_mode,
             )
         finally:
             session.close()

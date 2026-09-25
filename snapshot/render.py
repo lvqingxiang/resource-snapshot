@@ -16,13 +16,25 @@ from .styles import (
 )
 
 
+def _video_aspect_style(item: dict[str, object]) -> str:
+    """Give the player a box before metadata, so a 0-height clip is still seekable."""
+    try:
+        width = float(item.get("width") or 0)
+        height = float(item.get("height") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if width <= 0 or height <= 0:
+        return ""
+    return f' style="aspect-ratio:{width:g}/{height:g}"'
+
+
 def _public_media_cell_html(item: dict[str, object]) -> str:
     if item.get("type") == "video":
         return (
             '<div data-testid="videoPlayer" class="media-cell video-cell">'
             f'<video src="{_html_escape(item.get("url"))}" '
             f'poster="{_html_escape(item.get("poster"))}" '
-            'muted playsinline preload="auto"></video>'
+            f'muted playsinline preload="auto"{_video_aspect_style(item)}></video>'
             "</div>"
         )
     return (

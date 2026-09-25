@@ -293,13 +293,16 @@ def _collect_node_media_items(node: dict) -> list[dict[str, object]]:
         if not _media_item_is_video({"type": item.get("type"), "url": url}):
             return
         seen.add(url)
-        items.append(
-            {
-                "type": "video",
-                "url": url,
-                "poster": item.get("thumbnail_url") or item.get("thumbnail") or "",
-            }
-        )
+        entry: dict[str, object] = {
+            "type": "video",
+            "url": url,
+            "poster": item.get("thumbnail_url") or item.get("thumbnail") or "",
+        }
+        for key in ("width", "height"):
+            value = item.get(key)
+            if isinstance(value, (int, float)) and value > 0:
+                entry[key] = value
+        items.append(entry)
 
     all_media = media.get("all")
     if isinstance(all_media, list) and all_media:

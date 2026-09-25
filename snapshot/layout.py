@@ -12,7 +12,6 @@ from .config import (
 from .dom import (
     _hide_non_primary_columns,
     _scroll_tweet_into_view,
-    _wait_for_tweet_assets,
 )
 
 
@@ -1461,6 +1460,7 @@ def _capture_detail_snapshot(
     *,
     tweet_id: str | None = None,
     public_api_fallback: bool = False,
+    guest_mode: bool = False,
 ) -> None:
     """Capture the target tweet article itself.
 
@@ -1469,12 +1469,7 @@ def _capture_detail_snapshot(
     Taking an element screenshot is therefore safer than guessing a clip bottom.
     """
     _hide_non_primary_columns(page, tweet_id)
-    _scroll_tweet_into_view(page, tweet_card, guest_mode=True)
-    if not public_api_fallback:
-        _wait_for_tweet_assets(page, tweet_card)
-
-    # Viewport/layout changes can cause X to re-render parts of the footer.
-    page.wait_for_timeout(350)
+    _scroll_tweet_into_view(page, tweet_card, guest_mode=guest_mode)
     _hide_non_primary_columns(page, tweet_id)
 
     try:
@@ -1775,7 +1770,7 @@ def _capture_detail_snapshot(
                 "height": required_height,
             }
         )
-        page.wait_for_timeout(250)
+        page.wait_for_timeout(100)
 
         # Re-read the box because viewport resize can reflow X.
         box = tweet_card.bounding_box()
