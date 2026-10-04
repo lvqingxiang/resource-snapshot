@@ -1,16 +1,32 @@
 """Opt-in, offline Chromium integration checks: RUN_BROWSER_TESTS=1 python -m unittest discover -s tests -v."""
+import base64
 import os
 from pathlib import Path
+import struct
 from tempfile import TemporaryDirectory
-from time import monotonic
+from time import monotonic, sleep
 import unittest
 from unittest.mock import patch
+import zlib
 
 from playwright.sync_api import sync_playwright
 
-from snapshot.dom import _wait_for_tweet_card
+from snapshot.dom import _wait_for_decoded_images, _wait_for_tweet_card
 from snapshot import service
 from screenshot_service import capture_tweet_page
+
+
+def _png(width: int, height: int, rgba: bytes) -> bytes:
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    raw = b''.join(b'\x00' + rgba * width for _ in range(height))
+    return (
+        b'\x89PNG\r\n\x1a\n'
+        + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 6, 0, 0, 0))
+        + chunk(b'IDAT', zlib.compress(raw))
+        + chunk(b'IEND', b'')
+    )
 
 
 @unittest.skipUnless(os.getenv('RUN_BROWSER_TESTS') == '1', 'Set RUN_BROWSER_TESTS=1 for Chromium checks')
@@ -33,6 +49,50 @@ class LocalBrowserTests(unittest.TestCase):
             page.set_content('<article style="display:none" data-tweet-id="123">Hidden</article>'
                              '<article data-tweet-id="123">Visible</article>')
             self.assertEqual(_wait_for_tweet_card(page, '123', 1000).inner_text(), 'Visible')
+            browser.close()
+
+    def test_image_wait_holds_until_full_bitmap_and_keeps_original_on_failure(self):
+        small = _png(1, 1, b'\x00\x00\x00\xff')
+        large = _png(8, 4, b'\xff\x00\x00\xff')
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            released = {'full': False}
+
+            def serve_full(route):
+                if not released['full']:
+                    sleep(0.6)
+                    released['full'] = True
+                route.fulfill(status=200, content_type='image/png', body=large)
+
+            page.route('**/full.png', serve_full)
+            page.route('**/missing.png', lambda route: route.fulfill(status=404, body=b'nope'))
+            page.set_content(
+                '<article id="card">'
+                '<div data-testid="tweetPhoto" style="width:120px;height:80px">'
+                f'<img id="photo" alt="" style="width:100%;height:100%" src="data:image/png;base64,{base64.b64encode(small).decode()}"'
+                ' data-resource-snapshot-full-src="https://snapshot.test/full.png">'
+                '</div>'
+                '<div data-testid="tweetPhoto" style="width:120px;height:80px">'
+                f'<img id="broken" alt="" style="width:100%;height:100%" src="data:image/png;base64,{base64.b64encode(small).decode()}"'
+                ' data-resource-snapshot-full-src="https://snapshot.test/missing.png">'
+                '</div>'
+                '</article>'
+            )
+            card = page.locator('#card')
+            started = monotonic()
+            _wait_for_decoded_images(card, timeout_ms=5000)
+            elapsed = monotonic() - started
+            photo = page.locator('#photo')
+            broken = page.locator('#broken')
+            self.assertGreaterEqual(elapsed, 0.5)
+            self.assertEqual(photo.evaluate('(img) => img.naturalWidth'), 8)
+            self.assertEqual(photo.evaluate('(img) => img.naturalHeight'), 4)
+            self.assertIn('full.png', photo.evaluate('(img) => img.currentSrc || img.src'))
+            self.assertIsNone(photo.get_attribute('data-resource-snapshot-full-src'))
+            self.assertTrue(broken.evaluate('(img) => img.src.startsWith("data:image/png")'))
+            self.assertEqual(broken.evaluate('(img) => img.naturalWidth'), 1)
+            self.assertIsNone(broken.get_attribute('data-resource-snapshot-full-src'))
             browser.close()
 
     def test_public_preview_translates_text_without_media(self):

@@ -12,6 +12,7 @@ from .config import (
 from .dom import (
     _hide_non_primary_columns,
     _scroll_tweet_into_view,
+    _wait_for_decoded_images,
 )
 
 
@@ -169,12 +170,21 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                 clone.removeAttribute('style');
                 clone.className = '';
                 if (clone instanceof HTMLImageElement) {
-                  const upgraded = upgradeTwimgUrl(clone.currentSrc || clone.src, 'large');
-                  if (upgraded) {
-                    clone.src = upgraded;
+                  // Keep the bitmap already on screen. Swapping to name=large
+                  // here starts a new download, and the screenshot then catches
+                  // the JPEG mid-decode (photo on top, gray placeholder below).
+                  // The full-size URL is applied only after it has loaded.
+                  const displayed = img.currentSrc || img.src;
+                  const upgraded = upgradeTwimgUrl(displayed, 'large');
+                  if (displayed) {
+                    clone.src = displayed;
                   }
                   clone.removeAttribute('srcset');
-                  clone.sizes = '100vw';
+                  clone.loading = 'eager';
+                  clone.decoding = 'sync';
+                  if (upgraded && upgraded !== displayed) {
+                    clone.setAttribute('data-resource-snapshot-full-src', upgraded);
+                  }
                 }
                 clone.style.width = '100%';
                 clone.style.height = '100%';
@@ -1471,6 +1481,9 @@ def _capture_detail_snapshot(
     _hide_non_primary_columns(page, tweet_id)
     _scroll_tweet_into_view(page, tweet_card, guest_mode=guest_mode)
     _hide_non_primary_columns(page, tweet_id)
+    # Media prep may have queued a larger twimg URL. Row heights and the
+    # screenshot both need the finished bitmap, not the in-progress decode.
+    _wait_for_decoded_images(tweet_card)
 
     try:
         tweet_card.evaluate(
@@ -1771,6 +1784,7 @@ def _capture_detail_snapshot(
             }
         )
         page.wait_for_timeout(100)
+        _wait_for_decoded_images(tweet_card)
 
         # Re-read the box because viewport resize can reflow X.
         box = tweet_card.bounding_box()
@@ -1783,6 +1797,7 @@ def _capture_detail_snapshot(
             )
             bottom = int(box["y"] + box["height"]) + outer_margin
 
+    _wait_for_decoded_images(tweet_card)
     page.screenshot(
         path=str(path),
         animations="disabled",

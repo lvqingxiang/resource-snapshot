@@ -332,33 +332,181 @@ def _scroll_tweet_into_view(page, tweet_card, *, guest_mode: bool = False) -> No
     page.wait_for_timeout(80)
 
 
+# `img.complete` flips true once the response arrives, which is before Chromium
+# has decoded the bitmap. A screenshot in that window paints the top scanlines
+# and leaves the rest of the cell as the gray media placeholder.
+DECODED_IMAGE_TIMEOUT_MS = 12000
+
+
+def _wait_for_decoded_images(tweet_card, timeout_ms: int = DECODED_IMAGE_TIMEOUT_MS) -> None:
+    """Block until tweet photos are fully decoded, including late full-size swaps."""
+    try:
+        tweet_card.evaluate(
+            """
+            async (root, timeoutMs) => {
+              const FULL_SRC_ATTR = 'data-resource-snapshot-full-src';
+              const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+
+              const mediaImages = [...root.querySelectorAll('img')].filter((img) => {
+                if (!(img instanceof HTMLImageElement)) {
+                  return false;
+                }
+                const src = img.currentSrc || img.src || img.getAttribute('src') || '';
+                if (!src && !img.hasAttribute(FULL_SRC_ATTR)) {
+                  return false;
+                }
+                if (img.closest(
+                  '[data-testid="Tweet-User-Avatar"], [data-testid^="UserAvatar"], .avatar'
+                )) {
+                  return true;
+                }
+                if (img.closest(
+                  '[data-resource-snapshot-media-grid], [data-testid="tweetPhoto"], .media-cell, .media-grid, [data-testid="card.layoutLarge.media"], [data-testid="card.layoutSmall.media"]'
+                )) {
+                  return true;
+                }
+                const rect = img.getBoundingClientRect();
+                return rect.width >= 48 && rect.height >= 48;
+              });
+
+              const preload = (url) => new Promise((resolve) => {
+                const loader = new Image();
+                let settled = false;
+                const finish = () => {
+                  if (settled) {
+                    return;
+                  }
+                  settled = true;
+                  resolve(loader);
+                };
+                const timer = setTimeout(finish, Math.max(0, deadline - Date.now()));
+                loader.onload = () => {
+                  clearTimeout(timer);
+                  finish();
+                };
+                loader.onerror = () => {
+                  clearTimeout(timer);
+                  finish();
+                };
+                loader.src = url;
+              });
+
+              const paintReady = async (img) => {
+                try {
+                  await img.decode();
+                } catch (error) {
+                }
+                if (!img.complete || img.naturalWidth < 1) {
+                  return false;
+                }
+                try {
+                  const canvas = document.createElement('canvas');
+                  canvas.width = 1;
+                  canvas.height = 1;
+                  const context = canvas.getContext('2d');
+                  if (context) {
+                    context.drawImage(img, 0, 0, 1, 1);
+                  }
+                } catch (error) {
+                  return false;
+                }
+                return true;
+              };
+
+              const settle = async (img) => {
+                img.loading = 'eager';
+                img.decoding = 'sync';
+                const upgrade = img.getAttribute(FULL_SRC_ATTR) || '';
+                const previous = img.currentSrc || img.src || '';
+                if (upgrade && upgrade !== previous) {
+                  const loader = await preload(upgrade);
+                  if (loader.complete && loader.naturalWidth > 0 && Date.now() < deadline) {
+                    const targetWidth = loader.naturalWidth;
+                    const targetHeight = loader.naturalHeight;
+                    let sawLoad = false;
+                    const markLoad = () => {
+                      sawLoad = true;
+                    };
+                    img.addEventListener('load', markLoad, { once: true });
+                    img.removeAttribute('srcset');
+                    img.src = upgrade;
+                    const matchesUpgrade = () => {
+                      const shown = img.currentSrc || img.getAttribute('src') || img.src || '';
+                      return shown === upgrade || img.src === upgrade;
+                    };
+                    while (Date.now() < deadline) {
+                      // Same-cache swaps can report `complete` for the previous
+                      // frame for a moment. Require the upgraded pixel size,
+                      // and either the load event or the new URL.
+                      if (
+                        img.complete &&
+                        img.naturalWidth === targetWidth &&
+                        img.naturalHeight === targetHeight &&
+                        (sawLoad || matchesUpgrade())
+                      ) {
+                        if (await paintReady(img)) {
+                          img.removeAttribute(FULL_SRC_ATTR);
+                          return;
+                        }
+                      }
+                      await new Promise((resolve) => {
+                        const timer = setTimeout(resolve, 50);
+                        const done = () => {
+                          clearTimeout(timer);
+                          resolve();
+                        };
+                        img.addEventListener('load', done, { once: true });
+                        img.addEventListener('error', done, { once: true });
+                      });
+                    }
+                    img.removeEventListener('load', markLoad);
+                    // The larger file did not become paintable. Put the decoded
+                    // frame back so the capture cannot show a half-loaded JPEG.
+                    if (previous) {
+                      img.src = previous;
+                    }
+                  }
+                  img.removeAttribute(FULL_SRC_ATTR);
+                }
+
+                while (Date.now() < deadline) {
+                  if (img.complete && img.naturalWidth === 0) {
+                    return;
+                  }
+                  if (await paintReady(img)) {
+                    return;
+                  }
+                  await new Promise((resolve) => {
+                    const timer = setTimeout(resolve, 100);
+                    const done = () => {
+                      clearTimeout(timer);
+                      resolve();
+                    };
+                    img.addEventListener('load', done, { once: true });
+                    img.addEventListener('error', done, { once: true });
+                  });
+                }
+              };
+
+              await Promise.all(mediaImages.map((img) => settle(img)));
+              await new Promise((resolve) => {
+                requestAnimationFrame(() => requestAnimationFrame(resolve));
+              });
+            }
+            """,
+            timeout_ms,
+            timeout=timeout_ms + 3000,
+        )
+    except Exception:
+        return
+
+
 def _wait_for_tweet_assets(page, tweet_card) -> None:
     element = tweet_card.element_handle(timeout=5000)
     if element is None:
         return
 
-    try:
-        page.wait_for_function(
-            """
-            (el) => {
-              const images = [...el.querySelectorAll(
-                '[data-testid="tweetPhoto"] img, [data-testid="card.layoutLarge.media"] img, [data-testid="card.layoutSmall.media"] img, .media-cell img'
-              )].filter((img) => {
-                if (!(img instanceof HTMLImageElement) || img.offsetParent === null) {
-                  return false;
-                }
-                return !img.closest('[data-testid="Tweet-User-Avatar"], [data-testid^="UserAvatar"]');
-              });
-              return images.length === 0 || images.every(
-                (img) => img.complete && img.naturalWidth > 0
-              );
-            }
-            """,
-            arg=element,
-            timeout=8000,
-        )
-    except PlaywrightTimeoutError:
-        pass
+    _wait_for_decoded_images(tweet_card)
 
     try:
         page.wait_for_function(
@@ -415,22 +563,7 @@ def _wait_for_public_fallback_assets(page, tweet_card) -> None:
     if element is None:
         return
 
-    try:
-        page.wait_for_function(
-            """
-            (el) => {
-              const images = [...el.querySelectorAll('img')]
-                .filter((img) => img.offsetParent !== null);
-              return images.length === 0 || images.every(
-                (img) => img.complete && img.naturalWidth > 0
-              );
-            }
-            """,
-            arg=element,
-            timeout=2500,
-        )
-    except PlaywrightTimeoutError:
-        pass
+    _wait_for_decoded_images(tweet_card)
 
     try:
         page.wait_for_function(
