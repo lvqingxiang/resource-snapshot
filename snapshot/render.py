@@ -16,6 +16,60 @@ from .styles import (
 )
 
 
+def _status_view_count(status: dict | None) -> object | None:
+    if not isinstance(status, dict):
+        return None
+    for key in (
+        "views", "view_count", "viewCount", "views_count",
+        "impression_count", "impressionCount",
+    ):
+        value = status.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _format_public_count(value: object) -> str:
+    try:
+        number = float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return ""
+    sign = "-" if number < 0 else ""
+    number = abs(number)
+    if number >= 100_000_000:
+        return f"{sign}{number / 100_000_000:.1f}".rstrip("0").rstrip(".") + "亿"
+    if number >= 10_000:
+        return f"{sign}{number / 10_000:.1f}".rstrip("0").rstrip(".") + "万"
+    return f"{sign}{int(round(number))}"
+
+
+def _inject_public_view_count(tweet_card, status: dict | None) -> None:
+    """Add public view metrics to a detail card only when X omitted them."""
+    label = _format_public_count(_status_view_count(status)) if _status_view_count(status) is not None else ""
+    if not label:
+        return
+    try:
+        tweet_card.evaluate(
+            """(root, count) => {
+              const article = root.matches('article') ? root : root.querySelector('article') || root;
+              if (!(article instanceof HTMLElement)) return;
+              if (/(views|查看|次观看)/i.test(article.innerText || '')) return;
+              const row = document.createElement('div');
+              row.setAttribute('data-resource-snapshot-views-fallback', 'true');
+              row.textContent = `${count} Views`;
+              row.style.cssText = 'display:block;width:100%;box-sizing:border-box;padding:8px 12px 2px;color:#71767b;font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;text-align:left';
+              const actions = [...article.querySelectorAll('[role="group"]')].find((node) =>
+                node.querySelector('[data-testid="reply"], [data-testid="retweet"], [data-testid="like"], [data-testid="bookmark"]')
+              );
+              if (actions?.parentElement) actions.parentElement.insertBefore(row, actions);
+              else article.appendChild(row);
+            }""",
+            label,
+        )
+    except Exception:
+        pass
+
+
 def _video_aspect_style(item: dict[str, object]) -> str:
     """Give the player a box before metadata, so a 0-height clip is still seekable."""
     try:
@@ -173,7 +227,7 @@ def _render_public_status_card(page, status: dict, tweet_id: str, *, dark_mode: 
     repost = fmt_count(metric("retweets", "reposts", "retweet_count"))
     likes = fmt_count(metric("likes", "favorites", "like_count"))
     bookmarks = fmt_count(metric("bookmarks", "bookmark_count"))
-    views = fmt_count(metric("views", "view_count", "viewCount"))
+    views = fmt_count(metric("views", "view_count", "viewCount", "views_count", "impression_count", "impressionCount"))
     created = fmt_time()
 
     avatar_html = (

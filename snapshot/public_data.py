@@ -116,6 +116,7 @@ def _normalize_vxtwitter_status(data: dict) -> dict | None:
         "likes": data.get("likes"),
         "replies": data.get("replies"),
         "retweets": data.get("retweets"),
+        "views": data.get("views") or data.get("view_count") or data.get("viewCount") or data.get("views_count"),
     }
 
 
@@ -168,6 +169,7 @@ def _fetch_public_x_status(
     primary_status: dict | None = None
     primary_source = ""
     best_quote: dict | None = None
+    best_views: object | None = None
     def quote_rank(quote: dict | None) -> int:
         if not quote:
             return 0
@@ -184,6 +186,8 @@ def _fetch_public_x_status(
                 continue
             status = parser(data) if isinstance(data, dict) else None
             if isinstance(status, dict):
+                if best_views is None:
+                    best_views = _status_view_count(status)
                 quote = status.get("quote")
                 if isinstance(quote, dict) and quote_rank(quote) > quote_rank(best_quote):
                     best_quote = quote
@@ -194,6 +198,15 @@ def _fetch_public_x_status(
                 if primary_status is None:
                     primary_status = status
                     primary_source = source
+                else:
+                    # Mirrors can expose different metric fields. Preserve the
+                    # primary post payload while filling a missing view count
+                    # from another successful response.
+                    if _status_view_count(primary_status) is None:
+                        view_count = _status_view_count(status)
+                        if view_count is not None:
+                            primary_status = dict(primary_status)
+                            primary_status["views"] = view_count
     except FutureTimeoutError:
         pass
     finally:
@@ -202,10 +215,22 @@ def _fetch_public_x_status(
     selected = primary_status if primary_status is not None else fallback_status
     if selected is not None:
         selected = dict(selected)
+        if _status_view_count(selected) is None and best_views is not None:
+            selected["views"] = best_views
         if best_quote is not None:
             selected["quote"] = best_quote
         return selected, primary_source or fallback_source
     return None, ""
+
+
+def _status_view_count(status: dict | None) -> object | None:
+    if not isinstance(status, dict):
+        return None
+    for key in ("views", "view_count", "viewCount", "views_count", "impression_count", "impressionCount"):
+        value = status.get(key)
+        if value not in (None, ""):
+            return value
+    return None
 
 
 def _status_has_video_media(status: dict) -> bool:

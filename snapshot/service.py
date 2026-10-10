@@ -36,6 +36,7 @@ from .public_data import (
     _fetch_public_x_status,
 )
 from .render import (
+    _inject_public_view_count,
     _load_public_fallback_tweet_card,
     _prepare_public_fallback_card,
 )
@@ -155,6 +156,15 @@ def _load_tweet_card_once(
             tweet_card = _wait_for_tweet_card(page, tweet_id, wait_timeout_ms)
             if tweet_card is None:
                 raise RuntimeError("页面里没有找到可截图的推文主体")
+
+            if public_fetch is not None and not isinstance(public_status, dict):
+                try:
+                    fetched_status, fetched_source = public_fetch.result(timeout=1.5)
+                    if isinstance(fetched_status, dict):
+                        public_status, public_source = fetched_status, fetched_source
+                except Exception:
+                    pass
+            _inject_public_view_count(tweet_card, public_status)
 
             _expand_tweet_text(tweet_card)
             page.add_style_tag(content=_detail_capture_css(dark_mode))
