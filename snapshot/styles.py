@@ -133,6 +133,16 @@ article[data-resource-snapshot-multi-photo] [data-testid="tweetPhoto"] img {{
   object-position: center center !important;
 }}
 
+/* Public fallback grids can live inside an article marked single-photo when
+   the other attachment is a video. Keep that marker from shrinking the image. */
+article [data-public-api-media-grid]:not(.n1) .media-cell img {{
+  width: 100% !important;
+  height: 100% !important;
+  max-height: none !important;
+  object-fit: cover !important;
+  object-position: center center !important;
+}}
+
 article video {{
   display: block !important;
   max-width: 100% !important;

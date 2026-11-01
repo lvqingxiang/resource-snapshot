@@ -281,6 +281,7 @@ def _render_public_status_card(page, status: dict, tweet_id: str, *, dark_mode: 
       .media-cell{{min-height:220px;max-height:720px;background:{border};overflow:hidden;}}
       .media-grid.n2 .media-cell,.media-grid.n3 .media-cell,.media-grid.n4 .media-cell{{min-height:0;max-height:none;height:100%;}}
       .media-cell img{{width:100%;height:100%;max-height:720px;object-fit:cover;display:block;}}
+      .media-grid:not(.n1) .media-cell img{{height:100% !important;max-height:none !important;object-fit:cover !important;object-position:center !important;}}
       .media-grid.n1 .media-cell img{{height:auto;object-fit:contain;}}
       .video-cell{{display:flex;align-items:center;justify-content:center;}}
       .media-grid.n1 .video-cell{{aspect-ratio:auto;min-height:0;max-height:none;}}

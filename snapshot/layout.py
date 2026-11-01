@@ -629,6 +629,11 @@ def _prepare_tweet_media_for_screenshot(tweet_card) -> None:
                 if (img.closest(`[${GRID_ATTR}]`)) {
                   continue;
                 }
+                const publicGrid = img.closest('[data-public-api-media-grid]');
+                if (publicGrid && !publicGrid.classList.contains('n1')) {
+                  constrainMediaTree(img, { fillCover: true });
+                  continue;
+                }
                 const inTweetPhoto = Boolean(img.closest('[data-testid="tweetPhoto"]'));
                 if (multiPhoto && inTweetPhoto) {
                   constrainMediaTree(img, { fillCover: true });
@@ -1516,6 +1521,23 @@ def _capture_detail_snapshot(
                 engagementGroup.style.setProperty('padding-right', '12px', 'important');
                 engagementGroup.style.setProperty('box-sizing', 'border-box', 'important');
                 engagementGroup.style.setProperty('overflow', 'visible', 'important');
+              }
+
+              // Mixed grids need a definite row height: percentage image heights
+              // otherwise resolve against an intrinsic row and leave empty cells.
+              for (const grid of article.querySelectorAll('[data-public-api-media-grid]:not(.n1)')) {
+                if (!grid.querySelector('.video-cell')) continue;
+                const width = grid.getBoundingClientRect().width;
+                const rows = grid.classList.contains('n2') ? 1 : 2;
+                const height = width * (grid.classList.contains('n2') ? 9 / 16 :
+                  grid.classList.contains('n3') ? 3 / 4 : 8 / 7);
+                grid.style.setProperty('height', `${Math.round(height)}px`, 'important');
+                grid.style.setProperty('grid-template-rows', `repeat(${rows}, minmax(0, 1fr))`, 'important');
+                for (const img of grid.querySelectorAll('.media-cell img')) {
+                  img.style.setProperty('height', '100%', 'important');
+                  img.style.setProperty('max-height', 'none', 'important');
+                  img.style.setProperty('object-fit', 'cover', 'important');
+                }
               }
 
               // Photo-only fallback grids: align heights per row instead of
