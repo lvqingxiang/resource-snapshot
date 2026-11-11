@@ -224,7 +224,13 @@ def _render_public_status_card(page, status: dict, tweet_id: str, *, dark_mode: 
             )
 
     reply = fmt_count(metric("replies", "reply_count"))
-    repost = fmt_count(metric("retweets", "reposts", "retweet_count"))
+    # X 详情页转帖按钮显示的是「转帖 + 引用」合计，这里保持同一口径。
+    repost_n = _number(metric("retweets", "reposts", "retweet_count"))
+    quotes_n = _number(metric("quotes", "quote_count"))
+    if repost_n is not None and quotes_n:
+        repost = fmt_count(repost_n + quotes_n)
+    else:
+        repost = fmt_count(repost_n)
     likes = fmt_count(metric("likes", "favorites", "like_count"))
     bookmarks = fmt_count(metric("bookmarks", "bookmark_count"))
     views = fmt_count(metric("views", "view_count", "viewCount", "views_count", "impression_count", "impressionCount"))
